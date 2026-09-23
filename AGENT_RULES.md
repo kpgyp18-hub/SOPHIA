@@ -86,9 +86,11 @@ BLOCKING QUESTION이 선언되면 답변 전까지 다른 Agent는 영구 변경
 독립 Read/검색/테스트/로그 분석은 병렬화 가능. 동일 파일 Write, DB migration, git state change, shared config update는 직렬화한다.
 
 ## 18. Recursion Guard [정책+Live]
-동일 Provider로의 무한 재귀·순환 handoff를 막는다(원칙, 항상 적용).
+동일 Provider로의 무한 재귀·순환 handoff를 막는다(원칙, 항상 적용). 라이브 경로가 둘로 나뉘고 각각 다른 메커니즘을 쓰므로 구분해서 서술한다.
 
-**Live 강제(`scripts/supervisor/loop_guard.py`의 `LoopGuard`)**: 동일 대상 handoff 누적 4회(`MAX_AGENT_HANDOFFS`), cross-agent roundtrip 4회(`MAX_CROSS_AGENT_ROUNDTRIPS`), 동일 사유(`reason_code`) 반복 2회(`MAX_SAME_REASON_HANDOFFS`) 도달 시 차단(`NEED_USER`/`FAILED`).
+**`scripts/chat.py` 라이브 그룹챗 경로(`scripts/supervisor/chat_session.py`)**: `_MAX_AUTO_RELAY_HOPS=4` — "Codex에게:"/"Claude에게:" 자동 relay 누적 홉이 4회에 도달하면 중단. roundtrip·동일사유 구분 없는 단순 누적 카운터다.
+
+**`scripts/agents.py`(Supervisor) 경로(`scripts/supervisor/loop_guard.py`의 `LoopGuard`)**: 작업 내 전체 handoff 누적 4회(`MAX_AGENT_HANDOFFS`, 특정 대상 한정 아님), cross-agent roundtrip 4회(`MAX_CROSS_AGENT_ROUNDTRIPS`), 동일 사유(`reason_code`) 반복 2회(`MAX_SAME_REASON_HANDOFFS`) 도달 시 차단(`NEED_USER`/`FAILED`). `chat.py` 경로에는 연결되지 않는다.
 
 **미구현(설계만 존재, 근거 없음)**: `root_task_id`/`call_id`/`parent_call_id`/`provider`별 `depth`·`visited_providers` 추적, `max_brain_depth=3`, `max_external_cli_hops=1`, `max_handoff_cycle=2`는 현재 어떤 경로에도 구현돼 있지 않다 — 실제 근거(코드) 제시 전까지 "적용 중"으로 서술하지 않는다(§7).
 
