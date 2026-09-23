@@ -24,4 +24,4 @@ __pycache__/
 *.sqlite3
 *.jsonl
 .sophia/
-workspace/
+/workspace/
