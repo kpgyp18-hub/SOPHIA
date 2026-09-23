@@ -88,7 +88,7 @@ BLOCKING QUESTION이 선언되면 답변 전까지 다른 Agent는 영구 변경
 ## 18. Recursion Guard [정책+Live]
 동일 Provider로의 무한 재귀·순환 handoff를 막는다(원칙, 항상 적용). 라이브 경로가 둘로 나뉘고 각각 다른 메커니즘을 쓰므로 구분해서 서술한다.
 
-**`scripts/chat.py` 라이브 그룹챗 경로(`scripts/supervisor/chat_session.py`)**: `_MAX_AUTO_RELAY_HOPS=4` — "Codex에게:"/"Claude에게:" 자동 relay 누적 홉이 4회에 도달하면 중단. roundtrip·동일사유 구분 없는 단순 누적 카운터다.
+**`scripts/chat.py` 라이브 그룹챗 경로(`scripts/supervisor/chat_session.py`)**: `_MAX_AUTO_RELAY_HOPS=4` — "Codex에게:"/"Claude에게:" 자동 relay를 최대 4회 허용하고 5번째 시도를 중단한다. roundtrip·동일사유 구분 없는 단순 누적 카운터다. 수동 재멘션은 사용자 주도 재개로 별도 카운트다.
 
 **`scripts/agents.py`(Supervisor) 경로(`scripts/supervisor/loop_guard.py`의 `LoopGuard`)**: 작업 내 전체 handoff 누적 4회(`MAX_AGENT_HANDOFFS`, 특정 대상 한정 아님), cross-agent roundtrip 4회(`MAX_CROSS_AGENT_ROUNDTRIPS`), 동일 사유(`reason_code`) 반복 2회(`MAX_SAME_REASON_HANDOFFS`) 도달 시 차단(`NEED_USER`/`FAILED`). `chat.py` 경로에는 연결되지 않는다.
 
@@ -109,7 +109,7 @@ Trust class: SYSTEM, TRUSTED_POLICY, USER_TASK, TRUSTED_MEMORY, UNTRUSTED_DOCUME
 ## 23. Source of Truth [정책+Core]
 중복 진실원천 금지. Skill Catalog=Definition Source, SkillRegistry DB=Runtime Source of Truth, ToolRegistry=Tool/Risk Source of Truth, DecisionManager=Runtime Decision Trace.
 
-`SkillRegistry`(`sophia/skills/registry.py`), `ToolRegistry`(`sophia/runtime/tool_registry.py`), `DecisionManager`(`sophia/decisions/manager.py`)는 Core 모듈로 실재하지만 `scripts/` 라이브 경로는 이 인스턴스를 사용하지 않는다 — 그 경로의 실제 SoT는 파일(`skills/*/SKILL.md`)과 git 커밋 이력이다.
+`SkillRegistry`(`sophia/skills/registry.py`), `ToolRegistry`(`sophia/runtime/tool_registry.py`), `DecisionManager`(`sophia/decisions/manager.py`)는 Core 모듈로 실재하지만 `scripts/` 라이브 경로는 이 인스턴스를 사용하지 않는다 — 그 경로의 실제 SoT는 파일(`skills/*/SKILL.md`)과 git 커밋 이력이다. `scripts/agents.py`(Supervisor)의 스킬 처리는 `SKILL.md` 파일 존재 확인까지이며, `SkillRegistry` 등록·실행 파이프라인에는 연결돼 있지 않다.
 
 ## 24. Completion Standard
 요구사항 충족, 변경 범위 명확, 테스트/검증 완료, 위험 작업 승인, 원본 보호, 미해결 이슈 명시, 재현 가능성을 만족해야 완료다.
