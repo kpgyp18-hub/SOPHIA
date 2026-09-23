@@ -1,0 +1,12 @@
+decision:
+  primary:
+    provider: qwen_fast
+  fallback:
+    provider: rules
+  thresholds:
+    auto: 0.90
+    review: 0.70
+    crosscheck: 0.50
+  limits:
+    max_decision_hops: 2
+    timeout_ms: 1500

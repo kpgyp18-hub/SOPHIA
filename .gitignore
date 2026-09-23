@@ -1,0 +1,27 @@
+# SOPHIA runtime-core tracking only (interim: vault-rooted, see
+# output/SOPHIA_Runtime_Relocation_Plan.md section 5)
+# Everything is ignored by default; only the runtime-core paths below are unignored.
+
+/*
+
+!/sophia/
+!/config/
+!/scripts/
+!/tests/
+!/pytest.ini
+!/supervisor.execpolicy.rules
+!/.gitignore
+
+# caches and bytecode inside tracked dirs
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# runtime state / logs / databases that must never be committed, even if
+# they appear under a tracked path in the future
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+.sophia/
+workspace/

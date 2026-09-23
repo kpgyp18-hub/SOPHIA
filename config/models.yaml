@@ -1,0 +1,25 @@
+models:
+  fast:
+    provider: ollama
+    model: qwen3.5:4b
+    resident: false
+  general:
+    provider: ollama
+    model: qwen3.5:9b
+    resident: true
+  coder:
+    provider: ollama
+    model: qwen2.5-coder:7b-instruct-q4_K_M
+    resident: false
+  reasoning:
+    provider: ollama
+    model: phi4-reasoning:14b
+    resident: false
+  vision:
+    provider: ollama
+    model: qwen3.5:9b
+    resident: false
+  embedding:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    resident: optional

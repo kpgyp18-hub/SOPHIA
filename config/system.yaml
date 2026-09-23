@@ -1,0 +1,65 @@
+ollama_endpoint: http://127.0.0.1:11434
+resource_manager:
+  # RTX 3060 8GB: preserve one active generation model; probes are read-only.
+  idle_timeout_seconds: 300
+  inference_timeout_seconds: 180
+brains:
+  fast:
+    provider: ollama
+    model: qwen3.5:4b
+    # FAST is a bounded JSON decision provider; disable Qwen thinking to preserve its response body.
+    think: false
+  general:
+    provider: ollama
+    model: qwen3.5:9b
+  reasoning:
+    provider: ollama
+    model: phi4-reasoning:14b
+  coder:
+    provider: ollama
+    model: qwen2.5-coder:7b-instruct-q4_K_M
+  vision:
+    enabled: true
+    provider: ollama
+    model: qwen3.5:9b
+  safety_fast:
+    provider: ollama
+    model: llama-guard3:1b
+  safety_deep:
+    provider: ollama
+    model: granite4.1-guardian:8b
+  claude_cli:
+    enabled: false
+    provider: claude-cli
+  codex_cli:
+    enabled: false
+    provider: codex-cli
+database:
+  active: postgresql
+  fallback: sqlite
+  backends:
+    postgresql:
+      host: localhost
+      port: 5432
+      database: sophia
+      user: sophia
+      # password: SOPHIA_DB_PASSWORD 사용자 환경변수에서 읽음 (평문 저장 금지, sophia/database/adapters/postgresql.py 참고)
+    sqlite:
+      path: workspace/sophia/sophia.db
+embedding:
+  provider: ollama
+  model: qwen3-embedding:0.6b
+  dimensions: 1024
+safety:
+  fast:
+    enabled: true
+    model: llama-guard3:1b
+  deep:
+    enabled: true
+    model: granite4.1-guardian:8b
+  escalation:
+    R0: false
+    R1: false
+    R2: true
+    R3: true
+    R4: true

@@ -1,0 +1,2 @@
+prefix_rule(pattern = ["claude"], decision = "forbidden", justification = "Codex agents must not launch Claude directly; only the Supervisor Runner may own agent processes.")
+prefix_rule(pattern = ["claude.exe"], decision = "forbidden", justification = "Codex agents must not launch Claude directly; only the Supervisor Runner may own agent processes.")
