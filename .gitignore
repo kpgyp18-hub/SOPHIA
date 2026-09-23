@@ -11,6 +11,10 @@
 !/pytest.ini
 !/supervisor.execpolicy.rules
 !/.gitignore
+!/skills/
+!/AGENT_RULES.md
+!/AGENTS.md
+!/CLAUDE.md
 
 # caches and bytecode inside tracked dirs
 __pycache__/
