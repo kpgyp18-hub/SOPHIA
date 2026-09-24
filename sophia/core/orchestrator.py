@@ -295,6 +295,9 @@ class SophiaCore:
         selection = self.provider_resolver.resolve(
             task, brain_name, route=decision.escalation.route,
             health=self._provider_health(),
+            privacy_required=not (brain_override is not None and bool(
+                getattr(self.registry.get(brain_override), "external", False)
+            )),
             visited_providers=self.invocation_guard.visited_providers,
             resource_available=self.resources.can_schedule,
         )

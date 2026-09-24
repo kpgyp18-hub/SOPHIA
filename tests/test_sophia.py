@@ -188,6 +188,58 @@ def test_cli_brain_blocks_self_reference_before_calling_transport():
     assert called is False
 
 
+def test_cli_transport_uses_read_only_provider_commands(monkeypatch):
+    from sophia.brains.cli_transport import CliTransport
+
+    commands = []
+    class Completed:
+        returncode = 0
+        stdout = "answer\n"
+        stderr = ""
+
+    monkeypatch.setattr("sophia.brains.cli_transport.shutil.which", lambda name: name)
+    monkeypatch.setattr("sophia.brains.cli_transport.subprocess.run",
+                        lambda command, **kwargs: commands.append((command, kwargs)) or Completed())
+
+    claude = CliTransport("claude", cwd="workspace")("prompt")
+    codex = CliTransport("codex")("prompt")
+    assert claude.text == codex.text == "answer"
+    assert commands[0][0] == ["claude.cmd", "--print", "--permission-mode", "plan"]
+    assert commands[1][0] == ["codex.cmd", "exec", "--sandbox", "read-only", "--skip-git-repo-check"]
+    assert commands[0][1]["cwd"] == "workspace"
+
+
+def test_registry_injects_cli_transport_only_when_enabled(tmp_path):
+    from sophia.brains.cli import CliBrain
+    from sophia.brains.registry import load_registry
+
+    config = tmp_path / "system.yaml"
+    config.write_text("""brains:
+  general: {provider: ollama, model: general-model}
+  coder: {provider: ollama, model: coder-model}
+  claude_cli: {enabled: true, provider: claude-cli}
+  codex_cli: {enabled: false, provider: codex-cli}
+""", encoding="utf-8")
+    registry = load_registry(config, current_persona="codex")
+    assert isinstance(registry.get("claude_cli"), CliBrain)
+    assert registry.get("claude_cli").transport is not None
+    assert registry.get("claude_cli").current_persona == "codex"
+    assert registry.get("claude_cli").external is True
+    assert not registry.has("codex_cli")
+
+
+def test_explicit_cli_override_is_the_only_external_cli_selection_path(tmp_path):
+    from sophia.brains.cli import CliBrain
+
+    registry = BrainRegistry()
+    registry.register("general", StubBrain())
+    registry.register("coder", StubBrain())
+    registry.register("claude_cli", CliBrain("claude", lambda _prompt: BrainResult("external")))
+    core = SophiaCore(registry, tmp_path / "telemetry.jsonl")
+    _, result = core.run("ordinary chat", brain_override="claude_cli")
+    assert result.text == "external"
+
+
 def test_prior_coding_task_makes_a_filename_free_followup_a_file_continuation(tmp_path, monkeypatch):
     from sophia.brains.dummy import DummyBrain
 

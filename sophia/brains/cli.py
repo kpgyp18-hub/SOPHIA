@@ -22,6 +22,8 @@ class CliBrain:
         self.current_persona = current_persona.lower() if current_persona else None
         self.transport = transport
         self.model = f"{self.target_persona}-cli"
+        self.provider = self.model
+        self.external = True
 
     def generate(self, prompt: str) -> BrainResult:
         if self.current_persona == self.target_persona:

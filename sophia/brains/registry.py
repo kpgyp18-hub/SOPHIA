@@ -7,10 +7,12 @@ from typing import Any
 import yaml
 
 from sophia.brains.cli import CliBrain
+from sophia.brains.cli_transport import CliTransport
 from sophia.brains.ollama import BrainRegistry, OllamaBrain, OllamaEmbedder
 
 
-def load_registry(config_path: str | Path = "config/system.yaml") -> BrainRegistry:
+def load_registry(config_path: str | Path = "config/system.yaml", *,
+                  current_persona: str | None = None) -> BrainRegistry:
     config_file = Path(config_path)
     data: dict[str, Any] = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
     endpoint = str(data.get("ollama_endpoint", "http://127.0.0.1:11434"))
@@ -30,7 +32,10 @@ def load_registry(config_path: str | Path = "config/system.yaml") -> BrainRegist
                 raise ValueError(f"brain '{name}' think must be a boolean when configured")
             registry.register(str(name), OllamaBrain(str(definition["model"]), endpoint, think=think))
         elif provider in {"claude-cli", "codex-cli"}:
-            registry.register(str(name), CliBrain(str(provider).removesuffix("-cli")))
+            persona = str(provider).removesuffix("-cli")
+            registry.register(str(name), CliBrain(
+                persona, CliTransport(persona), current_persona=current_persona,
+            ))
         else:
             raise ValueError(f"brain '{name}' has unsupported provider: {provider}")
     for required in ("general", "coder"):
