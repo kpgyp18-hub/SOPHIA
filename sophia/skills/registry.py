@@ -23,6 +23,8 @@ class Skill:
     status: str = "candidate"
     skill_path: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    quality_score: float = 0.0
+    quality_samples: int = 0
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "Skill":
@@ -32,6 +34,8 @@ class Skill:
             owner=record.get("owner"), risk=str(record.get("risk") or "low"),
             status=str(record.get("status") or "candidate"), skill_path=record.get("skill_path"),
             metadata=dict(record.get("metadata") or {}),
+            quality_score=float(record.get("quality_score") or 0.0),
+            quality_samples=int(record.get("quality_samples") or 0),
         )
 
 
@@ -46,7 +50,8 @@ class SkillRegistry:
         payload = skill_payload(skill)
         stored_path = skill.skill_path
         if procedure is not None:
-            target = self.library / f"{skill.skill_id}.md"
+            safe_identifier = skill.skill_id.replace(":", "__").replace("/", "__").replace("\\", "__")
+            target = self.library / f"{safe_identifier}.md"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(procedure, encoding="utf-8")
             stored_path = str(target)
@@ -98,6 +103,28 @@ class SkillRegistry:
             raise KeyError(identifier)
         disabled = Skill(**{**skill_payload(skill), "status": "disabled"})
         return self.register(disabled)
+
+    def record_outcome(self, identifier: str, verdict: str, *, task_id: str | None = None,
+                       reason: str | None = None, window: int = 20) -> Skill:
+        skill = self.get(identifier, include_disabled=True)
+        if skill is None:
+            raise KeyError(identifier)
+        record = getattr(self.database.selected(), "record_skill_outcome", None)
+        if not callable(record):
+            raise RuntimeError("selected database backend does not support skill quality tracking")
+        record(skill.skill_id, verdict, task_id=task_id, reason=reason, window=window)
+        updated = self.get(skill.skill_id, include_disabled=True)
+        assert updated is not None
+        return updated
+
+    def history(self, identifier: str) -> list[Skill]:
+        skill = self.get(identifier, include_disabled=True)
+        if skill is None:
+            raise KeyError(identifier)
+        load = getattr(self.database.selected(), "skill_history", None)
+        if not callable(load):
+            raise RuntimeError("selected database backend does not support skill history")
+        return [Skill.from_record(record) for record in load(skill.skill_id)]
 
     def procedure(self, skill: Skill) -> str | None:
         if not skill.skill_path:

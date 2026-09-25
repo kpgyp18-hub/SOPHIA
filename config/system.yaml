@@ -63,3 +63,15 @@ safety:
     R2: true
     R3: true
     R4: true
+arbitration:
+  # Experimental v0.8.x layer. Disabled means zero routing impact.
+  enabled: false
+  backend: deterministic
+  operation: shadow
+  telemetry_path: workspace/sophia/arbitration.jsonl
+  learning:
+    enabled: false
+    rate: 0.02
+    minimum_samples: 3
+  modes:
+    default: normal

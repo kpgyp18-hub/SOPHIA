@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -33,11 +34,14 @@ def _complexity_bucket(complexity: float) -> str:
     return "complex"
 
 
-def suggest_codex_tier(task: Task, *, same_failure_count: int = 0) -> str | None:
+def suggest_codex_tier(task: Task, *, same_failure_count: int | None = None,
+                       failure_lookup: Callable[[Task], int] | None = None) -> str | None:
     """Ask the existing scripts/supervisor ModelRouter which Codex tier (LUNA/TERRA/SOL)
     would handle this task, without making any external call. Returns None when the
     deterministic rules can't decide (NEED_ARBITER) so the caller must ask a human/Blanc.
     """
+    if same_failure_count is None:
+        same_failure_count = failure_lookup(task) if failure_lookup is not None else 0
     router = ModelRouter()
     features = {
         "complexity": _complexity_bucket(task.complexity),
@@ -72,6 +76,9 @@ class EscalationPolicy:
 
     _EXTERNAL_TERMS = ("external", "cloud model", "api call", "외부 모델", "외부모델")
 
+    def __init__(self, failure_lookup: Callable[[Task], int] | None = None) -> None:
+        self.failure_lookup = failure_lookup
+
     def plan(self, task: Task) -> EscalationDecision:
         lowered = task.input.lower()
         if any(term in lowered for term in self._EXTERNAL_TERMS):
@@ -79,7 +86,7 @@ class EscalationPolicy:
                 EscalationRoute.USER_APPROVAL,
                 "external model requested",
                 requires_user_approval=True,
-                suggested_tier=suggest_codex_tier(task),
+                suggested_tier=suggest_codex_tier(task, failure_lookup=self.failure_lookup),
             )
         if task.task_type in (TaskType.ARCHITECTURE, TaskType.REVIEW) or task.complexity >= 0.5:
             return EscalationDecision(
@@ -100,5 +107,5 @@ class EscalationPolicy:
             EscalationRoute.USER_APPROVAL,
             "local execution reported a failure and needs direction",
             requires_user_approval=True,
-            suggested_tier=suggest_codex_tier(task),
+            suggested_tier=suggest_codex_tier(task, failure_lookup=self.failure_lookup),
         )

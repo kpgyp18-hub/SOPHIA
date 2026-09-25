@@ -7,6 +7,8 @@ commands.  Their metadata is persisted through :class:`DatabaseManager`.
 from sophia.skills.executor import SkillExecution, SkillExecutor
 from sophia.skills.registry import Skill, SkillRegistry
 from sophia.skills.validator import SkillValidationError, validate_skill
+from sophia.skills.catalog import CatalogAdapter, CatalogDocument, CatalogLoader
+from sophia.skills.intelligence import SkillCandidateLearner
 
 __all__ = [
     "Skill",
@@ -15,4 +17,8 @@ __all__ = [
     "SkillRegistry",
     "SkillValidationError",
     "validate_skill",
+    "CatalogAdapter",
+    "CatalogDocument",
+    "CatalogLoader",
+    "SkillCandidateLearner",
 ]

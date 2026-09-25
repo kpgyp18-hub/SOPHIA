@@ -97,19 +97,40 @@ class PostgreSQLBackend:
         self.migrate()
         with self._connect() as db, db.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO memory.skills(skill_id, name, version, owner, risk, status, description, skill_path, metadata) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
+                "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples "
+                "FROM memory.skills WHERE skill_id = %s FOR UPDATE", (skill["skill_id"],),
+            )
+            current = cursor.fetchone()
+            incoming = (
+                skill["skill_id"], skill["name"], skill["version"], skill.get("owner"), skill.get("risk"),
+                skill["status"], skill.get("description"), skill.get("skill_path"),
+                skill.get("metadata", {}), float(skill.get("quality_score", 0.0)),
+                int(skill.get("quality_samples", 0)),
+            )
+            if current is not None:
+                current_metadata = current[8] if isinstance(current[8], dict) else json.loads(current[8])
+                comparable = (*current[:8], current_metadata, *current[9:])
+                if comparable != incoming:
+                    cursor.execute(
+                        "INSERT INTO memory.skill_version_history(skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)",
+                        (*comparable[:8], json.dumps(comparable[8], ensure_ascii=False), *comparable[9:]),
+                    )
+            cursor.execute(
+                "INSERT INTO memory.skills(skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s) "
                 "ON CONFLICT (skill_id) DO UPDATE SET name=EXCLUDED.name, version=EXCLUDED.version, owner=EXCLUDED.owner, "
                 "risk=EXCLUDED.risk, status=EXCLUDED.status, description=EXCLUDED.description, skill_path=EXCLUDED.skill_path, "
-                "metadata=EXCLUDED.metadata, updated_at=now()",
+                "metadata=EXCLUDED.metadata, quality_score=EXCLUDED.quality_score, quality_samples=EXCLUDED.quality_samples, updated_at=now()",
                 (skill["skill_id"], skill["name"], skill["version"], skill.get("owner"), skill.get("risk"),
                  skill["status"], skill.get("description"), skill.get("skill_path"),
-                 json.dumps(skill.get("metadata", {}), ensure_ascii=False)),
+                 json.dumps(skill.get("metadata", {}), ensure_ascii=False),
+                 float(skill.get("quality_score", 0.0)), int(skill.get("quality_samples", 0))),
             )
 
     def get_skill(self, identifier: str, *, include_disabled: bool = False) -> dict[str, Any] | None:
         self.migrate()
-        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata FROM memory.skills WHERE (skill_id = %s OR name = %s)"
+        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples FROM memory.skills WHERE (skill_id = %s OR name = %s)"
         if not include_disabled:
             query += " AND status != 'disabled'"
         with self._connect() as db, db.cursor() as cursor:
@@ -119,7 +140,7 @@ class PostgreSQLBackend:
 
     def list_skills(self, *, status: str | None = "active") -> list[dict[str, Any]]:
         self.migrate()
-        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata FROM memory.skills"
+        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples FROM memory.skills"
         parameters: tuple[str, ...] = ()
         if status is not None:
             query += " WHERE status = %s"
@@ -127,6 +148,40 @@ class PostgreSQLBackend:
         query += " ORDER BY name, version"
         with self._connect() as db, db.cursor() as cursor:
             cursor.execute(query, parameters)
+            rows = cursor.fetchall()
+        return [self._skill_record(row) for row in rows]
+
+    def record_skill_outcome(self, skill_id: str, verdict: str, *, task_id: str | None = None,
+                             reason: str | None = None, window: int = 20) -> tuple[float, int]:
+        self.migrate()
+        normalized = verdict.upper()
+        if normalized not in {"PASS", "FAIL", "UNCERTAIN"}:
+            raise ValueError(f"unsupported skill verdict: {verdict}")
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM memory.skills WHERE skill_id = %s FOR UPDATE", (skill_id,))
+            if cursor.fetchone() is None:
+                raise KeyError(skill_id)
+            cursor.execute(
+                "INSERT INTO memory.skill_outcomes(skill_id, verdict, task_id, reason) VALUES (%s, %s, %s, %s)",
+                (skill_id, normalized, task_id, reason),
+            )
+            cursor.execute(
+                "SELECT verdict FROM memory.skill_outcomes WHERE skill_id = %s ORDER BY outcome_id DESC LIMIT %s",
+                (skill_id, window),
+            )
+            rows = cursor.fetchall()
+            score = sum(row[0] == "PASS" for row in rows) / len(rows)
+            cursor.execute("UPDATE memory.skills SET quality_score = %s, quality_samples = %s, updated_at=now() WHERE skill_id = %s",
+                           (score, len(rows), skill_id))
+        return score, len(rows)
+
+    def skill_history(self, skill_id: str) -> list[dict[str, Any]]:
+        self.migrate()
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(
+                "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples "
+                "FROM memory.skill_version_history WHERE skill_id = %s ORDER BY history_id", (skill_id,),
+            )
             rows = cursor.fetchall()
         return [self._skill_record(row) for row in rows]
 
@@ -152,5 +207,5 @@ class PostgreSQLBackend:
 
     @staticmethod
     def _skill_record(row: tuple[Any, ...]) -> dict[str, Any]:
-        keys = ("skill_id", "name", "version", "owner", "risk", "status", "description", "skill_path", "metadata")
+        keys = ("skill_id", "name", "version", "owner", "risk", "status", "description", "skill_path", "metadata", "quality_score", "quality_samples")
         return dict(zip(keys, row, strict=True))

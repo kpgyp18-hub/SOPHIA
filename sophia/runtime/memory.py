@@ -96,28 +96,41 @@ class ProjectMemory:
             self._archive_overflow(db)
 
     def search(self, query: str, limit: int = 3) -> list[str]:
+        """Return a bounded blend of semantic, lexical, and importance scores.
+
+        A missing or stale embedding no longer excludes an otherwise useful
+        lexical result.  Access accounting is updated only for rows that are
+        actually returned.
+        """
         if limit < 1:
             return []
         query_embedding = self._embed(query)
         terms = set(re.findall(r"\w+", query.lower()))
         with self._connect() as db:
-            rows = db.execute("SELECT id, text, embedding, embedding_model, embedding_dimension, embedding_version FROM memories ORDER BY id DESC LIMIT 200").fetchall()
-        semantic: list[tuple[float, int, str]] = []
-        if query_embedding is not None:
-            for entry_id, text, raw_embedding, model, dimension, version in rows:
-                if raw_embedding is None or (model, dimension, version) != (EMBEDDING_MODEL, len(query_embedding), EMBEDDING_VERSION):
-                    continue
+            rows = db.execute(
+                "SELECT id, text, embedding, embedding_model, embedding_dimension, embedding_version, "
+                "importance, trust_level, last_accessed_at, created_at FROM memories ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+        ranked: list[tuple[float, int, str]] = []
+        for entry_id, text, raw_embedding, model, dimension, version, importance, trust, last_accessed, created in rows:
+            lexical = len(terms & set(re.findall(r"\w+", text.lower()))) / max(1, len(terms))
+            semantic = 0.0
+            if query_embedding is not None and raw_embedding is not None and (
+                model, dimension, version
+            ) == (EMBEDDING_MODEL, len(query_embedding), EMBEDDING_VERSION):
                 try:
-                    score = self._cosine(query_embedding, json.loads(raw_embedding))
+                    semantic = max(0.0, self._cosine(query_embedding, json.loads(raw_embedding)))
                 except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                semantic.append((score, entry_id, text))
-        if semantic:
-            selected = [(entry_id, text) for score, entry_id, text in sorted(semantic, reverse=True) if score > 0][:limit]
-        else:
-            ranked = sorted(((len(terms & set(re.findall(r"\w+", text.lower()))), entry_id, text)
-                             for entry_id, text, *_ in rows), reverse=True)
-            selected = [(entry_id, text) for score, entry_id, text in ranked if score][:limit]
+                    semantic = 0.0
+            effective = max(0.0, min(1.0, self._effective_importance(
+                float(importance), str(trust), last_accessed, created,
+            )))
+            score = 0.55 * semantic + 0.30 * lexical + 0.15 * effective
+            if semantic > 0 or lexical > 0:
+                ranked.append((score, int(entry_id), str(text)))
+        selected = [(entry_id, text) for _score, entry_id, text in sorted(
+            ranked, key=lambda item: (-item[0], -item[1])
+        )[:limit]]
         if selected:
             now = datetime.now(timezone.utc).isoformat()
             with self._connect() as db:

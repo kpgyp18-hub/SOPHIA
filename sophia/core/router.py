@@ -13,6 +13,9 @@ class RoutingDecision:
 
 
 class Router:
+    def __init__(self, *, failure_lookup=None) -> None:
+        self.escalation_policy = EscalationPolicy(failure_lookup)
+
     def classify(self, text: str, hint: DecisionOutcome | None = None) -> Task:
         if hint is not None:
             kind = TaskType(hint.task_type)
@@ -54,4 +57,4 @@ class Router:
             task.complexity = 0.3
         context_class = "complex" if task.complexity >= 0.5 else "normal"
         return RoutingDecision(task, self.supervisor(task), self.brain(task), context_class,
-                               EscalationPolicy().plan(task))
+                               self.escalation_policy.plan(task))
