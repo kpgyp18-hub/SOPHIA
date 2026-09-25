@@ -24,6 +24,14 @@ class SQLiteBackend:
             db.execute("CREATE TABLE IF NOT EXISTS sophia_events (id INTEGER PRIMARY KEY, category TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_events_category ON sophia_events(category)")
             db.execute("CREATE TABLE IF NOT EXISTS sophia_skills (skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL, owner TEXT, risk TEXT, status TEXT NOT NULL, description TEXT, skill_path TEXT, metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(sophia_skills)")}
+            if "quality_score" not in columns:
+                db.execute("ALTER TABLE sophia_skills ADD COLUMN quality_score REAL NOT NULL DEFAULT 0.0")
+            if "quality_samples" not in columns:
+                db.execute("ALTER TABLE sophia_skills ADD COLUMN quality_samples INTEGER NOT NULL DEFAULT 0")
+            db.execute("CREATE TABLE IF NOT EXISTS sophia_skill_version_history (history_id INTEGER PRIMARY KEY, skill_id TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, owner TEXT, risk TEXT, status TEXT NOT NULL, description TEXT, skill_path TEXT, metadata TEXT NOT NULL, quality_score REAL NOT NULL, quality_samples INTEGER NOT NULL, superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_skill_history_id ON sophia_skill_version_history(skill_id, history_id DESC)")
+            db.execute("CREATE TABLE IF NOT EXISTS sophia_skill_outcomes (outcome_id INTEGER PRIMARY KEY, skill_id TEXT NOT NULL, verdict TEXT NOT NULL, task_id TEXT, reason TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             db.execute("CREATE TABLE IF NOT EXISTS sophia_session_summaries (summary_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, summary TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_session_summaries_session ON sophia_session_summaries(session_id, summary_id DESC)")
 
@@ -54,20 +62,36 @@ class SQLiteBackend:
     def save_skill(self, skill: dict[str, Any]) -> None:
         self.migrate()
         with self._connect() as db:
+            current = db.execute(
+                "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples "
+                "FROM sophia_skills WHERE skill_id = ?", (skill["skill_id"],),
+            ).fetchone()
+            incoming = (
+                skill["skill_id"], skill["name"], skill["version"], skill.get("owner"), skill.get("risk"),
+                skill["status"], skill.get("description"), skill.get("skill_path"),
+                json.dumps(skill.get("metadata", {}), ensure_ascii=False, sort_keys=True),
+                float(skill.get("quality_score", 0.0)), int(skill.get("quality_samples", 0)),
+            )
+            if current is not None:
+                comparable = (*current[:8], json.dumps(json.loads(current[8]), ensure_ascii=False, sort_keys=True), *current[9:])
+                if comparable != incoming:
+                    db.execute(
+                        "INSERT INTO sophia_skill_version_history(skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", comparable,
+                    )
             db.execute(
-                "INSERT INTO sophia_skills(skill_id, name, version, owner, risk, status, description, skill_path, metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO sophia_skills(skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(skill_id) DO UPDATE SET name=excluded.name, version=excluded.version, owner=excluded.owner, "
                 "risk=excluded.risk, status=excluded.status, description=excluded.description, skill_path=excluded.skill_path, "
-                "metadata=excluded.metadata, updated_at=CURRENT_TIMESTAMP",
-                (skill["skill_id"], skill["name"], skill["version"], skill.get("owner"), skill.get("risk"),
-                 skill["status"], skill.get("description"), skill.get("skill_path"),
-                 json.dumps(skill.get("metadata", {}), ensure_ascii=False)),
+                "metadata=excluded.metadata, quality_score=excluded.quality_score, quality_samples=excluded.quality_samples, "
+                "updated_at=CURRENT_TIMESTAMP",
+                incoming,
             )
 
     def get_skill(self, identifier: str, *, include_disabled: bool = False) -> dict[str, Any] | None:
         self.migrate()
-        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata FROM sophia_skills WHERE (skill_id = ? OR name = ?)"
+        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples FROM sophia_skills WHERE (skill_id = ? OR name = ?)"
         parameters: tuple[str, ...] = (identifier, identifier)
         if not include_disabled:
             query += " AND status != 'disabled'"
@@ -77,7 +101,7 @@ class SQLiteBackend:
 
     def list_skills(self, *, status: str | None = "active") -> list[dict[str, Any]]:
         self.migrate()
-        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata FROM sophia_skills"
+        query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples FROM sophia_skills"
         parameters: tuple[str, ...] = ()
         if status is not None:
             query += " WHERE status = ?"
@@ -85,6 +109,37 @@ class SQLiteBackend:
         query += " ORDER BY name, version"
         with self._connect() as db:
             rows = db.execute(query, parameters).fetchall()
+        return [self._skill_record(row) for row in rows]
+
+    def record_skill_outcome(self, skill_id: str, verdict: str, *, task_id: str | None = None,
+                             reason: str | None = None, window: int = 20) -> tuple[float, int]:
+        self.migrate()
+        normalized = verdict.upper()
+        if normalized not in {"PASS", "FAIL", "UNCERTAIN"}:
+            raise ValueError(f"unsupported skill verdict: {verdict}")
+        with self._connect() as db:
+            if db.execute("SELECT 1 FROM sophia_skills WHERE skill_id = ?", (skill_id,)).fetchone() is None:
+                raise KeyError(skill_id)
+            db.execute(
+                "INSERT INTO sophia_skill_outcomes(skill_id, verdict, task_id, reason) VALUES (?, ?, ?, ?)",
+                (skill_id, normalized, task_id, reason),
+            )
+            rows = db.execute(
+                "SELECT verdict FROM sophia_skill_outcomes WHERE skill_id = ? ORDER BY outcome_id DESC LIMIT ?",
+                (skill_id, window),
+            ).fetchall()
+            score = sum(row[0] == "PASS" for row in rows) / len(rows)
+            db.execute("UPDATE sophia_skills SET quality_score = ?, quality_samples = ?, updated_at=CURRENT_TIMESTAMP WHERE skill_id = ?",
+                       (score, len(rows), skill_id))
+        return score, len(rows)
+
+    def skill_history(self, skill_id: str) -> list[dict[str, Any]]:
+        self.migrate()
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples "
+                "FROM sophia_skill_version_history WHERE skill_id = ? ORDER BY history_id", (skill_id,),
+            ).fetchall()
         return [self._skill_record(row) for row in rows]
 
     def save_context_summary(self, session_id: str, summary: str, *, metadata: dict[str, Any]) -> None:
@@ -108,7 +163,7 @@ class SQLiteBackend:
 
     @staticmethod
     def _skill_record(row: tuple[Any, ...]) -> dict[str, Any]:
-        keys = ("skill_id", "name", "version", "owner", "risk", "status", "description", "skill_path", "metadata")
+        keys = ("skill_id", "name", "version", "owner", "risk", "status", "description", "skill_path", "metadata", "quality_score", "quality_samples")
         record = dict(zip(keys, row, strict=True))
         record["metadata"] = json.loads(record["metadata"])
         return record

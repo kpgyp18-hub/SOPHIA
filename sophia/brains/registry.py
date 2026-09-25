@@ -7,10 +7,13 @@ from typing import Any
 import yaml
 
 from sophia.brains.cli import CliBrain
+from sophia.brains.cli_transport import CliTransport
 from sophia.brains.ollama import BrainRegistry, OllamaBrain, OllamaEmbedder
+from sophia.arbitration import ArbitrationMode, ArbitrationTelemetry, NeuralArbitrator, RewardUpdater
 
 
-def load_registry(config_path: str | Path = "config/system.yaml") -> BrainRegistry:
+def load_registry(config_path: str | Path = "config/system.yaml", *,
+                  current_persona: str | None = None) -> BrainRegistry:
     config_file = Path(config_path)
     data: dict[str, Any] = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
     endpoint = str(data.get("ollama_endpoint", "http://127.0.0.1:11434"))
@@ -30,7 +33,10 @@ def load_registry(config_path: str | Path = "config/system.yaml") -> BrainRegist
                 raise ValueError(f"brain '{name}' think must be a boolean when configured")
             registry.register(str(name), OllamaBrain(str(definition["model"]), endpoint, think=think))
         elif provider in {"claude-cli", "codex-cli"}:
-            registry.register(str(name), CliBrain(str(provider).removesuffix("-cli")))
+            persona = str(provider).removesuffix("-cli")
+            registry.register(str(name), CliBrain(
+                persona, CliTransport(persona), current_persona=current_persona,
+            ))
         else:
             raise ValueError(f"brain '{name}' has unsupported provider: {provider}")
     for required in ("general", "coder"):
@@ -74,3 +80,35 @@ def load_embedder(config_path: str | Path = "config/system.yaml") -> OllamaEmbed
     if not isinstance(dimensions, int) or isinstance(dimensions, bool) or dimensions <= 0:
         raise ValueError("embedding.dimensions must be a positive integer")
     return OllamaEmbedder(embedding["model"], str(data.get("ollama_endpoint", "http://127.0.0.1:11434")), dimensions=dimensions)
+
+
+def load_arbitrator(config_path: str | Path = "config/system.yaml") -> NeuralArbitrator:
+    data: dict[str, Any] = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    settings = data.get("arbitration", {})
+    if not isinstance(settings, dict):
+        raise ValueError("arbitration must be a mapping")
+    backend = settings.get("backend", "deterministic")
+    if backend != "deterministic":
+        raise ValueError("only the deterministic arbitration backend is supported")
+    enabled = settings.get("enabled", False)
+    learning = settings.get("learning", {})
+    if not isinstance(enabled, bool) or not isinstance(learning, dict):
+        raise ValueError("arbitration enabled/learning configuration is invalid")
+    learning_enabled = learning.get("enabled", False)
+    if not isinstance(learning_enabled, bool):
+        raise ValueError("arbitration.learning.enabled must be boolean")
+    rate = learning.get("rate", 0.02)
+    minimum_samples = learning.get("minimum_samples", 3)
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or not isinstance(minimum_samples, int):
+        raise ValueError("arbitration learning rate/minimum_samples are invalid")
+    operation = str(settings.get("operation", "shadow"))
+    mode_settings = settings.get("modes", {})
+    if not isinstance(mode_settings, dict):
+        raise ValueError("arbitration.modes must be a mapping")
+    mode = ArbitrationMode(str(mode_settings.get("default", "normal")))
+    telemetry = ArbitrationTelemetry(str(settings.get("telemetry_path", "workspace/sophia/arbitration.jsonl")))
+    return NeuralArbitrator.default(
+        enabled=enabled, operation=operation, mode=mode, telemetry=telemetry,
+        learning_enabled=learning_enabled,
+        reward_updater=RewardUpdater(learning_rate=float(rate), minimum_samples=minimum_samples),
+    )

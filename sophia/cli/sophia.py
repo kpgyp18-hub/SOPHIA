@@ -4,7 +4,7 @@ import argparse
 import json
 import unicodedata
 
-from sophia.brains.registry import load_database_config, load_embedder, load_registry, load_resource_manager_config
+from sophia.brains.registry import load_arbitrator, load_database_config, load_embedder, load_registry, load_resource_manager_config
 from sophia.core.orchestrator import SophiaCore
 from sophia.database import DatabaseManager
 
@@ -14,7 +14,8 @@ def build_core(*, interactive: bool = False) -> SophiaCore:
         return input(f"LEVEL 3 approval required — {description}. Continue? [y/N] ").strip().lower() in {"y", "yes"}
     return SophiaCore(load_registry(), approval=approve if interactive else None,
                       database=DatabaseManager(load_database_config()),
-                      resource_manager_config=load_resource_manager_config(), embedder=load_embedder())
+                      resource_manager_config=load_resource_manager_config(), embedder=load_embedder(),
+                      arbitrator=load_arbitrator())
 
 
 def status_lines(core: SophiaCore) -> list[str]:

@@ -37,6 +37,11 @@ from sophia.workers import WorkerCall, WorkerOperation, WorkerStatus
 from sophia.judge import JudgeLayer, JudgeVerdict, RuleJudge
 from sophia.security import InjectionDetector, SecretRedactor, TrustLabel, isolate_context
 from sophia.runtime.cancellation import CancellationRegistry, TaskCancelledError
+from sophia.arbitration import NeuralArbitrator
+from sophia.core.adaptive import AdaptiveScoreStore, FailureMemory
+from sophia.runtime.maintenance import AutonomousMaintenance
+from sophia.runtime.retrieval import RetrievalRouter
+from sophia.skills import CatalogAdapter, CatalogLoader, SkillCandidateLearner
 
 
 class SophiaCore:
@@ -45,8 +50,11 @@ class SophiaCore:
                  task_store: TaskStore | None = None, context_manager: ContextManager | None = None,
                  approval: ApprovalCallback | None = None, database: DatabaseManager | None = None,
                  resource_manager_config: dict[str, float] | None = None,
-                 judge: JudgeLayer | None = None, embedder: Embedder | None = None) -> None:
-        self.registry, self.router = registry, Router()
+                 judge: JudgeLayer | None = None, embedder: Embedder | None = None,
+                 arbitrator: NeuralArbitrator | None = None) -> None:
+        self.registry = registry
+        self.failure_memory = FailureMemory(Path(telemetry_path).with_name("failure-memory.jsonl"))
+        self.router = Router(failure_lookup=lambda task: self.failure_memory.count(task_type=task.task_type.value))
         self.resources = ResourceManager(registry, **(resource_manager_config or {}))
         self.decision_manager = DecisionManager(
             QwenFastDecisionProvider(registry.get("fast")) if registry.has("fast") else None,
@@ -78,10 +86,18 @@ class SophiaCore:
         self.vision = VisionAdapter()
         self.skill_registry = SkillRegistry(self.database, library=self.telemetry_path.parent / "skills")
         self.skill_executor = SkillExecutor(self.skill_registry)
+        self.skill_learner = SkillCandidateLearner(self.skill_registry)
+        self.catalog_loader = CatalogLoader()
+        self.catalog_adapter = CatalogAdapter(self.skill_registry, self.tool_registry)
+        self.retrieval_router = RetrievalRouter()
+        self.adaptive_scores = AdaptiveScoreStore()
+        self.arbitrator = arbitrator
+        self._active_skill_by_task: dict[str, str] = {}
         self.worker_pool = WorkerPool(tool_registry=self.tool_registry)
         self.worker_pool.register_handler("memory-search", self._memory_search_worker)
         self.health = HealthManager(registry, self.database, self.tools.workspace,
                                     self.tool_registry, self.worker_pool)
+        self.maintenance = AutonomousMaintenance(self.memory, self.skill_registry)
         self.runtime_events: dict[str, list[dict[str, object]]] = {}
         self.cancellations = CancellationRegistry()
 
@@ -120,6 +136,7 @@ class SophiaCore:
         self.runtime_events.setdefault(task.id, []).append({"kind": "skill", "skill_id": execution.skill_id,
                                                              "status": execution.status,
                                                              "duration_ms": execution.duration_ms})
+        self._active_skill_by_task[task.id] = execution.skill_id
         if execution.status != "completed":
             return f"Skill {identifier}: {execution.status} ({execution.error})"
         return f"Skill {identifier} result: {execution.result}"
@@ -277,6 +294,24 @@ class SophiaCore:
         decision_outcome = self.decision_manager.decide(user_input)
         decision = self.router.decide(user_input, coding_continuation=continuation_requested, hint=decision_outcome)
         task, supervisor, brain_name = decision.task, decision.supervisor, decision.brain
+        arbitration_state: dict[str, float] = {}
+        if self.arbitrator is not None and self.arbitrator.enabled:
+            failure_count = self.failure_memory.count(task_type=task.task_type.value, brain=brain_name)
+            arbitration_state["state.provider_failure"] = min(1.0, failure_count / 3)
+            usage = self.resources.usage()
+            if usage.vram_total_mib and usage.vram_free_mib is not None:
+                arbitration_state["state.low_vram"] = 1.0 - usage.vram_free_mib / usage.vram_total_mib
+            try:
+                arbitration_graph = getattr(self.arbitrator.backend, "graph", None)
+                for skill in self.skill_registry.list(status="active"):
+                    node_id = f"skill.{skill.name}"
+                    if skill.quality_samples and arbitration_graph is not None and node_id in arbitration_graph.nodes:
+                        arbitration_state[node_id] = min(0.15, skill.quality_score * 0.15)
+            except RuntimeError:
+                pass
+        arbitration_result = self.arbitrator.recommend(
+            task, user_input, state=arbitration_state, actual_route=supervisor,
+        ) if self.arbitrator is not None else None
         self._record_injection(task.id, user_input, source_type="user_input", source_id=task.id)
         cancellation = self.cancellations.create(task.id)
         self.runtime_events.setdefault(task.id, []).append({
@@ -284,6 +319,12 @@ class SophiaCore:
             "confidence": decision_outcome.confidence, "review_required": decision_outcome.review_required,
             "crosscheck_required": decision_outcome.crosscheck_required,
         })
+        if arbitration_result is not None:
+            self.runtime_events.setdefault(task.id, []).append({
+                "kind": "arbitration", "mode": arbitration_result.mode.value,
+                "operation": self.arbitrator.operation, "winners": list(arbitration_result.winners),
+                "supervisor_hint_only": True,
+            })
         self.state_machine.transition(task, TaskStatus.ROUTED)
         if brain_override is not None:
             if not self.registry.has(brain_override):
@@ -292,11 +333,19 @@ class SophiaCore:
             brain_name = brain_override
         elif decision.context_class == "complex" and self.registry.has("reasoning"):
             brain_name = "reasoning"
+        adaptive_scores = self.adaptive_scores.scores()
+        if self.arbitrator is not None:
+            for name, bias in self.arbitrator.provider_biases(arbitration_result).items():
+                adaptive_scores[name] = adaptive_scores.get(name, 0.0) + bias
         selection = self.provider_resolver.resolve(
             task, brain_name, route=decision.escalation.route,
             health=self._provider_health(),
+            privacy_required=not (brain_override is not None and bool(
+                getattr(self.registry.get(brain_override), "external", False)
+            )),
             visited_providers=self.invocation_guard.visited_providers,
             resource_available=self.resources.can_schedule,
+            adaptive_scores=adaptive_scores or None,
         )
         if selection.requires_user_approval:
             self.state_machine.transition(task, TaskStatus.USER_DECISION_REQUIRED)
@@ -347,6 +396,8 @@ class SophiaCore:
             self._finish(task, supervisor, brain_name, decision, user_input, result, target_path, [])
             return task, result
         except RuntimeError as error:
+            self.failure_memory.record(task_type=task.task_type.value, brain=brain_name, reason=str(error),
+                                       skill_id=self._active_skill_by_task.get(task.id))
             self.state_machine.transition(task, TaskStatus.PAUSED)
             result = BrainResult(f"TASK_PAUSED: {error}")
             self._finish(task, supervisor, brain_name, decision, user_input, result, target_path, [])
@@ -476,6 +527,25 @@ class SophiaCore:
                                         "review_count": task.review_count, "tool_calls": task.tool_calls},
                               result="completed" if task.status is TaskStatus.COMPLETED else result.text)
         self.context_manager.add(task.id, user_input, result.text, target_path=target_path, task_type=task.task_type.value)
+        skill_id = self._active_skill_by_task.pop(task.id, None)
+        if skill_id is not None:
+            verdict = "PASS" if task.status is TaskStatus.COMPLETED else "FAIL" if task.status is TaskStatus.FAILED else "UNCERTAIN"
+            try:
+                self.skill_registry.record_outcome(skill_id, verdict, task_id=task.id, reason=result.text[:500])
+            except (KeyError, RuntimeError):
+                pass
+        if task.status is TaskStatus.COMPLETED and task.tool_calls:
+            try:
+                self.skill_learner.observe_success(task.task_type.value, user_input,
+                                                   description="Repeated successful runtime task pattern.")
+            except (OSError, RuntimeError, ValueError):
+                pass
+        if task.status is TaskStatus.FAILED:
+            self.failure_memory.record(task_type=task.task_type.value, brain=brain_name, reason=result.text,
+                                       skill_id=skill_id)
+        if self.arbitrator is not None:
+            verdict = "PASS" if task.status is TaskStatus.COMPLETED else "FAIL" if task.status is TaskStatus.FAILED else "UNCERTAIN"
+            self.arbitrator.feedback(verdict)
         self.memory.add(task.id, f"User: {user_input}\nSOPHIA: {result.text}", source_type="runtime_task",
                         source_id=task.id, session_id=self.session_id, supervisor=supervisor, brain=brain_name,
                         provider=result.provider or "local", confidence=1.0, trust_level="TOOL_VERIFIED")

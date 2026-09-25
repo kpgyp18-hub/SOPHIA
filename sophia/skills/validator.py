@@ -35,6 +35,10 @@ def validate_skill(skill: "Skill") -> None:
         raise SkillValidationError("skill description is required")
     if not isinstance(skill.metadata, dict):
         raise SkillValidationError("skill metadata must be a dictionary")
+    if not 0.0 <= skill.quality_score <= 1.0:
+        raise SkillValidationError("skill quality_score must be between 0 and 1")
+    if skill.quality_samples < 0:
+        raise SkillValidationError("skill quality_samples cannot be negative")
 
 
 def skill_payload(skill: "Skill") -> dict[str, Any]:
