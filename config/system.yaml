@@ -29,10 +29,10 @@ brains:
     provider: ollama
     model: granite4.1-guardian:8b
   claude_cli:
-    enabled: false
+    enabled: true
     provider: claude-cli
   codex_cli:
-    enabled: false
+    enabled: true
     provider: codex-cli
 database:
   active: postgresql
