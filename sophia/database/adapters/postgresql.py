@@ -205,7 +205,144 @@ class PostgreSQLBackend:
             return None
         return {"summary": row[0], "metadata": row[1] if isinstance(row[1], dict) else json.loads(row[1])}
 
+    def save_goal(self, goal: dict[str, Any], *, event_type: str,
+                  event_payload: dict[str, Any]) -> None:
+        self.migrate()
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO runtime.goals(goal_id, title, description, owner, target_date, priority, status, success_criteria, satisfied_criteria, constraints, risk_ceiling, autonomy_budget, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s, %s) "
+                "ON CONFLICT (goal_id) DO UPDATE SET title=EXCLUDED.title, description=EXCLUDED.description, "
+                "owner=EXCLUDED.owner, target_date=EXCLUDED.target_date, priority=EXCLUDED.priority, status=EXCLUDED.status, "
+                "success_criteria=EXCLUDED.success_criteria, satisfied_criteria=EXCLUDED.satisfied_criteria, "
+                "constraints=EXCLUDED.constraints, risk_ceiling=EXCLUDED.risk_ceiling, "
+                "autonomy_budget=EXCLUDED.autonomy_budget, updated_at=EXCLUDED.updated_at",
+                (
+                    goal["goal_id"], goal["title"], goal["description"], goal["owner"], goal.get("target_date"),
+                    goal["priority"], goal["status"], json.dumps(goal["success_criteria"], ensure_ascii=False),
+                    json.dumps(goal["satisfied_criteria"], ensure_ascii=False),
+                    json.dumps(goal["constraints"], ensure_ascii=False), goal["risk_ceiling"],
+                    json.dumps(goal["autonomy_budget"], ensure_ascii=False, sort_keys=True),
+                    goal["created_at"], goal["updated_at"],
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO runtime.goal_events(goal_id, event_type, payload) VALUES (%s, %s, %s::jsonb)",
+                (goal["goal_id"], event_type, json.dumps(event_payload, ensure_ascii=False, sort_keys=True)),
+            )
+
+    def get_goal(self, goal_id: str) -> dict[str, Any] | None:
+        self.migrate()
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(f"SELECT {self._GOAL_COLUMNS} FROM runtime.goals WHERE goal_id = %s", (goal_id,))
+            row = cursor.fetchone()
+        return self._goal_record(row) if row else None
+
+    def list_goals(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        self.migrate()
+        query = f"SELECT {self._GOAL_COLUMNS} FROM runtime.goals"
+        parameters: tuple[str, ...] = ()
+        if status is not None:
+            query += " WHERE status = %s"
+            parameters = (status,)
+        query += " ORDER BY priority DESC, created_at, goal_id"
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(query, parameters)
+            rows = cursor.fetchall()
+        return [self._goal_record(row) for row in rows]
+
+    def save_goal_task(self, task: dict[str, Any], *, event_type: str,
+                       event_payload: dict[str, Any]) -> None:
+        self.migrate()
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO runtime.long_tasks(task_id, goal_id, parent_task_id, title, description, priority, status, required_skills, required_capabilities, risk, approval_requirement, deadline, retry_policy, checkpoint_policy, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) "
+                "ON CONFLICT (task_id) DO UPDATE SET parent_task_id=EXCLUDED.parent_task_id, title=EXCLUDED.title, "
+                "description=EXCLUDED.description, priority=EXCLUDED.priority, status=EXCLUDED.status, "
+                "required_skills=EXCLUDED.required_skills, required_capabilities=EXCLUDED.required_capabilities, "
+                "risk=EXCLUDED.risk, approval_requirement=EXCLUDED.approval_requirement, deadline=EXCLUDED.deadline, "
+                "retry_policy=EXCLUDED.retry_policy, checkpoint_policy=EXCLUDED.checkpoint_policy, updated_at=EXCLUDED.updated_at",
+                self._goal_task_values(task),
+            )
+            cursor.execute("DELETE FROM runtime.task_dependencies WHERE task_id = %s", (task["task_id"],))
+            for dependency in task["dependencies"]:
+                cursor.execute(
+                    "INSERT INTO runtime.task_dependencies(task_id, dependency_task_id) VALUES (%s, %s)",
+                    (task["task_id"], dependency),
+                )
+            cursor.execute(
+                "INSERT INTO runtime.long_task_events(task_id, event_type, payload) VALUES (%s, %s, %s::jsonb)",
+                (task["task_id"], event_type, json.dumps(event_payload, ensure_ascii=False, sort_keys=True)),
+            )
+
+    def get_goal_task(self, task_id: str) -> dict[str, Any] | None:
+        self.migrate()
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(f"SELECT {self._GOAL_TASK_COLUMNS} FROM runtime.long_tasks WHERE task_id = %s", (task_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            cursor.execute("SELECT dependency_task_id FROM runtime.task_dependencies WHERE task_id = %s ORDER BY dependency_task_id", (task_id,))
+            dependencies = [item[0] for item in cursor.fetchall()]
+        return self._goal_task_record(row, dependencies)
+
+    def list_goal_tasks(self, goal_id: str) -> list[dict[str, Any]]:
+        self.migrate()
+        with self._connect() as db, db.cursor() as cursor:
+            cursor.execute(f"SELECT {self._GOAL_TASK_COLUMNS} FROM runtime.long_tasks WHERE goal_id = %s ORDER BY created_at, task_id", (goal_id,))
+            rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT d.task_id, d.dependency_task_id FROM runtime.task_dependencies d "
+                "JOIN runtime.long_tasks t ON t.task_id = d.task_id WHERE t.goal_id = %s ORDER BY d.dependency_task_id",
+                (goal_id,),
+            )
+            dependency_rows = cursor.fetchall()
+        dependencies: dict[str, list[str]] = {}
+        for task_id, dependency in dependency_rows:
+            dependencies.setdefault(task_id, []).append(dependency)
+        return [self._goal_task_record(row, dependencies.get(row[0], [])) for row in rows]
+
     @staticmethod
     def _skill_record(row: tuple[Any, ...]) -> dict[str, Any]:
         keys = ("skill_id", "name", "version", "owner", "risk", "status", "description", "skill_path", "metadata", "quality_score", "quality_samples")
         return dict(zip(keys, row, strict=True))
+
+    _GOAL_COLUMNS = "goal_id, title, description, owner, target_date::text, priority, status, success_criteria, satisfied_criteria, constraints, risk_ceiling, autonomy_budget, created_at::text, updated_at::text"
+
+    @staticmethod
+    def _goal_record(row: tuple[Any, ...]) -> dict[str, Any]:
+        keys = ("goal_id", "title", "description", "owner", "target_date", "priority", "status",
+                "success_criteria", "satisfied_criteria", "constraints", "risk_ceiling",
+                "autonomy_budget", "created_at", "updated_at")
+        record = dict(zip(keys, row, strict=True))
+        for name in ("success_criteria", "satisfied_criteria", "constraints", "autonomy_budget"):
+            if not isinstance(record[name], (list, dict)):
+                record[name] = json.loads(record[name])
+        return record
+
+    _GOAL_TASK_COLUMNS = "task_id, goal_id, parent_task_id, title, description, priority, status, required_skills, required_capabilities, risk, approval_requirement, deadline::text, retry_policy, checkpoint_policy, created_at::text, updated_at::text"
+
+    @staticmethod
+    def _goal_task_values(task: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            task["task_id"], task["goal_id"], task.get("parent_task_id"), task["title"], task["description"],
+            task["priority"], task["status"], json.dumps(task["required_skills"], ensure_ascii=False),
+            json.dumps(task["required_capabilities"], ensure_ascii=False), task["risk"],
+            task["approval_requirement"], task.get("deadline"),
+            json.dumps(task["retry_policy"], ensure_ascii=False, sort_keys=True),
+            json.dumps(task["checkpoint_policy"], ensure_ascii=False, sort_keys=True),
+            task["created_at"], task["updated_at"],
+        )
+
+    @staticmethod
+    def _goal_task_record(row: tuple[Any, ...], dependencies: list[str]) -> dict[str, Any]:
+        keys = ("task_id", "goal_id", "parent_task_id", "title", "description", "priority", "status",
+                "required_skills", "required_capabilities", "risk", "approval_requirement", "deadline",
+                "retry_policy", "checkpoint_policy", "created_at", "updated_at")
+        record = dict(zip(keys, row, strict=True))
+        for name in ("required_skills", "required_capabilities", "retry_policy", "checkpoint_policy"):
+            if not isinstance(record[name], (list, dict)):
+                record[name] = json.loads(record[name])
+        record["dependencies"] = dependencies
+        return record

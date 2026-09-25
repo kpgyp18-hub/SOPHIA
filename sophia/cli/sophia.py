@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import unicodedata
 
 from sophia.brains.registry import load_arbitrator, load_database_config, load_embedder, load_registry, load_resource_manager_config
 from sophia.core.orchestrator import SophiaCore
 from sophia.database import DatabaseManager
+from sophia.goals import GoalStatus
 
 
 def build_core(*, interactive: bool = False) -> SophiaCore:
@@ -44,6 +46,7 @@ _HELP_ENTRIES = [
     ("/auto", "자동 라우팅으로 되돌립니다. (/brain auto 와 동일)"),
     ("/blanc, /aide", "블랑(추론) 또는 에이드(코더) 역할로 전환합니다."),
     ("/run <메시지>", "REPL을 유지한 채 작업을 한 번 실행합니다."),
+    ("/goal <하위명령>", "장기 목표 관리: create|list|status|activate|pause|resume|satisfy|complete|cancel"),
     ("/shell <명령>", "셸 명령을 실행합니다."),
     ("/delete <경로>", "파일을 삭제합니다."),
     ("/db <하위명령>", "데이터베이스 관리: status|list|check|backup <경로>|restore <경로>|migrate|switch <postgresql|sqlite>"),
@@ -64,6 +67,60 @@ def help_text() -> str:
     lines = ["S.O.P.H.I.A 명령어 안내"]
     lines += [f"  {_pad_display(command, width)}  {description}" for command, description in _HELP_ENTRIES]
     return "\n".join(lines)
+
+
+def _goal_summary(goal) -> str:
+    completed = len(goal.satisfied_criteria)
+    total = len(goal.success_criteria)
+    return f"{goal.goal_id} {goal.status.value.upper()} [{completed}/{total}] {goal.title}"
+
+
+def _goal_command(core: SophiaCore, command: str) -> str:
+    """Handle the manual v0.9 goal lifecycle without executing goal work."""
+    tokens = shlex.split(command, posix=False)
+    if not tokens or tokens[0] == "list":
+        status = GoalStatus(tokens[1].lower()) if len(tokens) > 1 else None
+        goals = core.goals.list(status=status)
+        return "\n".join(_goal_summary(goal) for goal in goals) if goals else "[Goal] none"
+    action = tokens[0].lower()
+    if action == "create":
+        title: list[str] = []
+        criteria: list[str] = []
+        activate = False
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--activate":
+                activate = True
+                index += 1
+            elif token == "--criteria":
+                if index + 1 >= len(tokens):
+                    raise ValueError("--criteria requires a value")
+                criteria.append(tokens[index + 1].strip('"'))
+                index += 2
+            elif criteria or activate:
+                raise ValueError(f"unknown goal create option: {token}")
+            else:
+                title.append(token.strip('"'))
+                index += 1
+        goal = core.goals.create(" ".join(title), success_criteria=criteria, activate=activate)
+        return "[Goal] " + _goal_summary(goal)
+    if len(tokens) < 2:
+        raise ValueError(f"goal id is required for {action}")
+    goal_id = tokens[1]
+    if action == "status":
+        goal = core.goals.get(goal_id)
+        missing = [item for item in goal.success_criteria if item not in goal.satisfied_criteria]
+        return _goal_summary(goal) + (f"\nMissing: {', '.join(missing)}" if missing else "")
+    if action == "satisfy":
+        if len(tokens) < 3:
+            raise ValueError("criterion is required for satisfy")
+        goal = core.goals.satisfy(goal_id, " ".join(tokens[2:]).strip('"'))
+    elif action in {"activate", "pause", "resume", "complete", "cancel"}:
+        goal = getattr(core.goals, action)(goal_id)
+    else:
+        raise ValueError(f"unknown goal command: {action}")
+    return "[Goal] " + _goal_summary(goal)
 
 
 def main() -> int:
@@ -129,6 +186,12 @@ def main() -> int:
         if text.startswith("/run "):
             task, result = core.run(text.removeprefix("/run ").strip(), brain_override=brain_override)
             print(f"[{task.id}] {result.text}")
+            continue
+        if text == "/goal" or text.startswith("/goal "):
+            try:
+                print(_goal_command(core, text.removeprefix("/goal").strip()))
+            except (KeyError, ValueError) as error:
+                print(f"[Goal] failed: {error}")
             continue
         if text.startswith("/db"):
             command = text.removeprefix("/db").strip()

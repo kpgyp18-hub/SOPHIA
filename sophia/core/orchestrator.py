@@ -42,6 +42,7 @@ from sophia.core.adaptive import AdaptiveScoreStore, FailureMemory
 from sophia.runtime.maintenance import AutonomousMaintenance
 from sophia.runtime.retrieval import RetrievalRouter
 from sophia.skills import CatalogAdapter, CatalogLoader, SkillCandidateLearner
+from sophia.goals import GoalManager, PlanManager, TaskQueue
 
 
 class SophiaCore:
@@ -71,6 +72,9 @@ class SophiaCore:
         self.telemetry_path = Path(telemetry_path)
         self.task_store = task_store or TaskStore()
         self.database = database or DatabaseManager(root=self.telemetry_path.parent)
+        self.goals = GoalManager(self.database)
+        self.plans = PlanManager(self.database)
+        self.goal_queue = TaskQueue(self.plans)
         self.session_id = f"session-{uuid4().hex}"
         self.context_compressor = ContextCompressor(self.database)
         self.context_manager = context_manager or ContextManager(

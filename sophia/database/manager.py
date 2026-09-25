@@ -80,6 +80,30 @@ class DatabaseManager:
             return None
         return load(session_id)
 
+    def save_goal(self, goal: dict[str, Any], *, event_type: str,
+                  event_payload: dict[str, Any] | None = None) -> str:
+        backend = self.selected()
+        backend.save_goal(goal, event_type=event_type, event_payload=event_payload or {})
+        return backend.name
+
+    def get_goal(self, goal_id: str) -> dict[str, Any] | None:
+        return self.selected().get_goal(goal_id)
+
+    def list_goals(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        return self.selected().list_goals(status=status)
+
+    def save_goal_task(self, task: dict[str, Any], *, event_type: str,
+                       event_payload: dict[str, Any] | None = None) -> str:
+        backend = self.selected()
+        backend.save_goal_task(task, event_type=event_type, event_payload=event_payload or {})
+        return backend.name
+
+    def get_goal_task(self, task_id: str) -> dict[str, Any] | None:
+        return self.selected().get_goal_task(task_id)
+
+    def list_goal_tasks(self, goal_id: str) -> list[dict[str, Any]]:
+        return self.selected().list_goal_tasks(goal_id)
+
     def status_lines(self) -> list[str]:
         return [f"{name.upper():<10} {'OK' if health.ok else 'DOWN'} {health.detail}" + (" pgvector=OK" if health.vector_ready else "") for name, health in self.health().items()]
 
