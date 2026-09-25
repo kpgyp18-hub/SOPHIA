@@ -65,7 +65,10 @@ safety:
     R4: true
 arbitration:
   # Experimental v0.8.x layer. Disabled means zero routing impact.
-  enabled: false
+  # Phase B (2026-09-25): enabled for shadow data collection only.
+  # operation: shadow makes provider_biases() return {}, so routing is
+  # unchanged; the arbiter only records recommendations for comparison.
+  enabled: true
   backend: deterministic
   operation: shadow
   telemetry_path: workspace/sophia/arbitration.jsonl

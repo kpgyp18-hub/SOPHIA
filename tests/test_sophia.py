@@ -188,7 +188,7 @@ def test_cli_brain_blocks_self_reference_before_calling_transport():
     assert called is False
 
 
-def test_cli_transport_uses_read_only_provider_commands(monkeypatch):
+def test_cli_transport_uses_read_only_provider_commands(monkeypatch, tmp_path):
     from sophia.brains.cli_transport import CliTransport
 
     commands = []
@@ -198,6 +198,10 @@ def test_cli_transport_uses_read_only_provider_commands(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr("sophia.brains.cli_transport.shutil.which", lambda name: name)
+    profile_variable = "USERPROFILE" if __import__("os").name == "nt" else "HOME"
+    monkeypatch.setenv(profile_variable, str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    (tmp_path / ".codex").mkdir()
     monkeypatch.setattr("sophia.brains.cli_transport.subprocess.run",
                         lambda command, **kwargs: commands.append((command, kwargs)) or Completed())
 
@@ -209,6 +213,8 @@ def test_cli_transport_uses_read_only_provider_commands(monkeypatch):
     assert commands[0][1]["cwd"] == "workspace"
     assert commands[0][1]["encoding"] == "utf-8"
     assert commands[0][1]["errors"] == "replace"
+    assert "CODEX_HOME" not in commands[0][1]["env"]
+    assert commands[1][1]["env"]["CODEX_HOME"] == str(tmp_path / ".codex")
 
 
 def test_registry_injects_cli_transport_only_when_enabled(tmp_path):

@@ -32,7 +32,7 @@ class CliTransport:
             completed = subprocess.run(
                 self._command(binary), input=prompt, text=True, capture_output=True,
                 cwd=self.cwd, timeout=self.timeout_seconds, check=False,
-                encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace", env=self._environment(),
             )
         except subprocess.TimeoutExpired as error:
             raise OSError(f"{self.provider} CLI timed out after {self.timeout_seconds:g}s") from error
@@ -56,3 +56,13 @@ class CliTransport:
         if self.provider == "claude":
             return [binary, "--print", "--permission-mode", "plan"]
         return [binary, "exec", "--sandbox", "read-only", "--skip-git-repo-check"]
+
+    def _environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        if self.provider != "codex" or env.get("CODEX_HOME"):
+            return env
+        profile = env.get("USERPROFILE" if os.name == "nt" else "HOME")
+        default_home = Path(profile) / ".codex" if profile else None
+        if default_home is not None and default_home.is_dir():
+            env["CODEX_HOME"] = str(default_home)
+        return env
