@@ -207,6 +207,8 @@ def test_cli_transport_uses_read_only_provider_commands(monkeypatch):
     assert commands[0][0] == ["claude.cmd", "--print", "--permission-mode", "plan"]
     assert commands[1][0] == ["codex.cmd", "exec", "--sandbox", "read-only", "--skip-git-repo-check"]
     assert commands[0][1]["cwd"] == "workspace"
+    assert commands[0][1]["encoding"] == "utf-8"
+    assert commands[0][1]["errors"] == "replace"
 
 
 def test_registry_injects_cli_transport_only_when_enabled(tmp_path):

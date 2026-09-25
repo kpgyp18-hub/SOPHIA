@@ -32,6 +32,7 @@ class CliTransport:
             completed = subprocess.run(
                 self._command(binary), input=prompt, text=True, capture_output=True,
                 cwd=self.cwd, timeout=self.timeout_seconds, check=False,
+                encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired as error:
             raise OSError(f"{self.provider} CLI timed out after {self.timeout_seconds:g}s") from error
