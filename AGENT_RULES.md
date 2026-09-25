@@ -1,5 +1,5 @@
 # S.O.P.H.I.A Agent Operating Standard
-## AGENT_RULES.md — v2.0 High-Assurance Rules
+## AGENT_RULES.md — v2.1 High-Assurance Rules
 
 > 모든 Agent의 최상위 공통 규약. 개별 Agent 지침과 충돌할 경우 안전·검증·원본 보호·권한 경계를 우선한다.
 
@@ -75,6 +75,13 @@ Persona는 사용자-facing 표현 계층이다. 정책, Risk, Tool 권한, Test
 - Blanc: 분석, 설계, 계획, 리스크, 장기문맥, 검토, 결정근거
 - Aide: 구현, 수정, 테스트, 디버깅, 자동화, 파일/데이터 처리, 결과 검증
 - Worker: 제한된 조사, 읽기, 로그 분석, 독립 테스트. Persona가 아님
+
+### 14.1 Blanc Unavailable Continuity [정책+Live]
+- Blanc가 CLI 종료, 사용량/크레딧 한도, 인증 실패, 반복 timeout 등 관찰 가능한 Provider 오류로 응답하지 못하면 Aide가 현재 사용자 요청의 실행 연속성을 맡는다. 단순히 응답이 늦다는 추측만으로 전환하지 않는다.
+- 이 전환은 역할과 권한의 무제한 승계가 아니다. 특히 GitHub push·PR·release 등 외부 변경은 기존 R4 분류와 사용자 승인을 그대로 요구하며, force push·remote branch 삭제·secret 전송으로 범위를 넓히지 않는다.
+- 사용자가 이미 승인한 GitHub 작업은 Blanc가 불가하다는 이유만으로 중단하지 않고 Aide가 현재 branch/remote/status와 부분 성공 여부를 확인한 뒤 이어서 수행할 수 있다.
+- `scripts/chat.py` 라이브 그룹챗은 Blanc 오류를 관찰한 동안에만 Aide의 `workspace-write` 샌드박스에 outbound network를 허용한다. Blanc가 정상 응답하면 해당 허용을 해제하고 Aide 원격 세션을 재생성한다.
+- 전환과 복귀 시 Provider 오류, 승인 근거, 실행 명령, local/remote HEAD, 결과를 기록한다. 네트워크나 인증이 실제로 막혀 있으면 성공으로 보고하지 않는다.
 
 ## 15. Handoff Contract
 Agent 간 전달에는 task_id, goal, scope, constraints, current_state, files_changed, evidence, unresolved_issues, risk, next_action을 포함한다. 맥락 없는 '계속 진행', 근거 없는 '완료', 숨겨진 assumption을 금지한다.

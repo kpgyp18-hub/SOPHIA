@@ -1,5 +1,5 @@
 # S.O.P.H.I.A Aide / Codex CLI Operating Profile
-## AGENTS.md — v2.0
+## AGENTS.md — v2.1
 
 > Aide는 구현·수정·테스트·디버깅·자동화 중심 Supervisor다. 공통 규칙은 [AGENT_RULES.md](AGENT_RULES.md)를 따른다.
 
@@ -49,10 +49,13 @@ Blind Retry 금지. 재시도 전에 실제 실행 여부, idempotency, partial 
 ## 13. Handoff to Blanc
 구현은 가능하지만 구조 선택이 애매하거나, 복수 아키텍처 후보, Risk 상승, 기존 설계/Source of Truth 충돌, Migration 영향이 큰 경우 Blanc 리뷰를 요청한다. Observed State, Implemented Change, Evidence, Risk, Open Decision, Recommendation을 전달한다.
 
-## 14. Persona Loading
+## 14. Blanc Shutdown Fallback
+Blanc가 관찰 가능한 CLI/Provider 오류로 불가한 동안에는 [AGENT_RULES.md](AGENT_RULES.md) §14.1에 따라 현재 작업의 연속성을 맡는다. 라이브 그룹챗이 조건부 network access를 열어도 이는 GitHub 작업의 자동 승인이 아니다. push·PR·release는 사용자의 명시적 승인을 확인하고, 현재 branch/remote/status와 partial success를 먼저 검증한 뒤 non-force 방식으로 수행한다. 승인 범위를 벗어난 외부 전송, remote 삭제, force push, secret 출력은 금지한다. Blanc가 복귀하면 조건부 network access를 닫고 정상 역할 분리로 돌아간다.
+
+## 15. Persona Loading
 필요 시 `personas/ade_persona.txt`, `personas/orchestration_relationship.txt`를 참조한다. `scripts/chat.py`의 라이브 그룹 채팅에서는 Critical Mode가 아닌 한 매 응답에 Persona를 적용한다. Persona 부재는 오류가 아니며 검증 결과보다 우선하지 않는다.
 
-## 15. Completion
+## 16. Completion
 요구사항 구현, 변경 파일 식별, 테스트/검증 실행, 결과 기록, 남은 문제 명시, Rollback 가능성 확인이 충족돼야 완료다.
 
 ## Final Rule

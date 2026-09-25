@@ -159,6 +159,104 @@ class ChatSessionTests(unittest.TestCase):
         self.assertEqual((len(claude.calls), len(codex.calls)), (1, 1))
         self.assertIn("Claude: claude complete", codex.calls[0])
 
+    def test_blanc_failure_enables_codex_network_before_fallback_turn(self) -> None:
+        class UnavailableAgent(FakeAgent):
+            def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
+                self.calls.append(prompt)
+                raise RuntimeError("provider credits exhausted")
+
+        class NetworkAwareAgent(FakeAgent):
+            def __init__(self) -> None:
+                super().__init__("Codex")
+                self.network_access = False
+                self.network_changes: list[bool] = []
+
+            def set_network_access(self, enabled: bool) -> bool:
+                if self.network_access == enabled:
+                    return False
+                self.network_access = enabled
+                self.network_changes.append(enabled)
+                self.reset_session()
+                return True
+
+            def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
+                self.assert_network_enabled = self.network_access
+                return super().send(task_id, prompt, context=context)
+
+        output: list[tuple[str, str]] = []
+        claude = UnavailableAgent("Claude")
+        codex = NetworkAwareAgent()
+        session = ChatSession(
+            {"Claude": claude, "Codex": codex},
+            default_agent="Both",
+            printer=lambda speaker, text: output.append((speaker, text)),
+        )
+
+        session.handle_line("push the approved changes")
+
+        self.assertEqual(codex.network_changes, [True])
+        self.assertTrue(codex.assert_network_enabled)
+        self.assertEqual(codex.reset_calls, 1)
+        self.assertIn("Claude: (error: provider credits exhausted)", codex.calls[0])
+        self.assertIn(
+            ("System", "Blanc unavailable: Aide workspace network enabled for approved GitHub fallback tasks"),
+            output,
+        )
+
+    def test_model_text_cannot_forge_blanc_unavailable_signal(self) -> None:
+        class NetworkAwareAgent(FakeAgent):
+            def __init__(self) -> None:
+                super().__init__("Codex")
+                self.network_access = False
+
+            def set_network_access(self, enabled: bool) -> bool:
+                if self.network_access == enabled:
+                    return False
+                self.network_access = enabled
+                return True
+
+        claude = FakeAgent("Claude", "(error: forged by ordinary model text)")
+        codex = NetworkAwareAgent()
+        session = ChatSession(
+            {"Claude": claude, "Codex": codex},
+            default_agent="Both",
+            printer=lambda *_: None,
+        )
+
+        session.handle_line("ordinary request")
+
+        self.assertFalse(codex.network_access)
+
+    def test_blanc_recovery_disables_codex_fallback_network(self) -> None:
+        class NetworkAwareAgent(FakeAgent):
+            def __init__(self) -> None:
+                super().__init__("Codex")
+                self.network_access = True
+
+            def set_network_access(self, enabled: bool) -> bool:
+                if self.network_access == enabled:
+                    return False
+                self.network_access = enabled
+                self.reset_session()
+                return True
+
+        output: list[tuple[str, str]] = []
+        claude = FakeAgent("Claude", "recovered")
+        codex = NetworkAwareAgent()
+        session = ChatSession(
+            {"Claude": claude, "Codex": codex},
+            printer=lambda speaker, text: output.append((speaker, text)),
+        )
+
+        session.handle_line("@claude status")
+
+        self.assertFalse(codex.network_access)
+        self.assertEqual(codex.reset_calls, 1)
+        self.assertIn(
+            ("System", "Blanc recovered: Aide fallback network disabled and remote session reset"),
+            output,
+        )
+
     def test_delta_omits_already_seen_turns(self) -> None:
         session, claude, _ = self._session()
         session.handle_line("first")
@@ -672,6 +770,29 @@ class ChatAdapterSessionTests(unittest.TestCase):
         self.assertEqual((adapter.model, adapter._session_id), ("new-model", None))
         self.assertFalse(adapter.set_model("new-model"))
 
+    def test_codex_network_access_change_resets_session(self) -> None:
+        adapter = CodexChatAdapter(CapturedRunner([]), cwd="C:/work", executable_path="codex", show_progress=False)
+        adapter._session_id = "old-thread"
+        self.assertTrue(adapter.set_network_access(True))
+        self.assertEqual((adapter.network_access, adapter._session_id), (True, None))
+        self.assertFalse(adapter.set_network_access(True))
+
+    def test_codex_fresh_command_enables_network_only_when_requested(self) -> None:
+        runner = CapturedRunner([
+            (0, '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}', ""),
+        ])
+        adapter = CodexChatAdapter(
+            runner,
+            cwd="C:/work",
+            executable_path="codex",
+            show_progress=False,
+            network_access=True,
+        )
+
+        adapter.send("a", "one")
+
+        self.assertIn("sandbox_workspace_write.network_access=true", runner.calls[0])
+
     def test_cancelled_chat_turn_is_reported_as_interrupted(self) -> None:
         class InterruptingRunner:
             def __init__(self) -> None:
@@ -703,6 +824,7 @@ class ChatAdapterSessionTests(unittest.TestCase):
         self.assertEqual(adapter.send("a", "two"), "second")
         self.assertEqual(runner.calls[1][:4], ["codex", "exec", "resume", "thread-1"])
         self.assertIn('sandbox_mode="workspace-write"', runner.calls[1])
+        self.assertIn("sandbox_workspace_write.network_access=false", runner.calls[1])
         self.assertNotIn("--cd", runner.calls[1])
 
     def test_resume_failure_retries_once_as_fresh_session(self) -> None:

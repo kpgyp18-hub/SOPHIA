@@ -251,9 +251,11 @@ class CodexChatAdapter(ChatAdapter):
     executable = "codex"
     display_name = "Codex"
 
-    def __init__(self, *args, sandbox: str = "workspace-write", model: str | None = None, **kwargs) -> None:
+    def __init__(self, *args, sandbox: str = "workspace-write", model: str | None = None,
+                 network_access: bool = False, **kwargs) -> None:
         super().__init__(*args, model=model, **kwargs)
         self.sandbox = sandbox
+        self.network_access = network_access
         # Unlike Claude, Codex's --json turn events never name the model that
         # actually ran. Read its own config for the default it would resolve
         # to, so an unset --model still shows a concrete name instead of a
@@ -282,11 +284,23 @@ class CodexChatAdapter(ChatAdapter):
             command += ["--sandbox", self.sandbox, "--cd", self.cwd]
             for extra_dir in self.extra_writable_dirs:
                 command += ["--add-dir", extra_dir]
+        if self.sandbox == "workspace-write":
+            enabled = str(self.network_access).lower()
+            command += ["--config", f"sandbox_workspace_write.network_access={enabled}"]
         command += ["--skip-git-repo-check"]
         if self.model:
             command += ["--model", self.model]
         command += ["--json"]
         return command
+
+    def set_network_access(self, enabled: bool) -> bool:
+        """Change outbound access for future turns and discard the old sandbox session."""
+        enabled = bool(enabled)
+        if self.network_access == enabled:
+            return False
+        self.network_access = enabled
+        self.reset_session()
+        return True
 
     def set_model(self, model: str | None) -> bool:
         changed = super().set_model(model)

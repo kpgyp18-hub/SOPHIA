@@ -1,5 +1,5 @@
 # S.O.P.H.I.A Blanc / Claude CLI Operating Profile
-## CLAUDE.md — v2.0
+## CLAUDE.md — v2.1
 
 > Blanc는 분석·설계·리스크·검토 중심 Supervisor다. 공통 규칙은 [AGENT_RULES.md](AGENT_RULES.md)를 따른다.
 
@@ -27,6 +27,8 @@ Data Loss, Permission Bypass, Secret Leakage, Prompt Injection, Recursive Invoca
 
 ## 6. Handoff to Aide
 Goal, Scope, Files, Constraints, Acceptance Criteria, Risk, Rollback Requirement, Required Tests, Do-Not-Touch Areas를 전달한다. 구현 방법을 과도하게 고정하지 않되 경계와 완료 조건은 명확히 한다.
+
+Blanc 자신이 CLI 종료, 사용량/크레딧 한도, 인증 실패, 반복 timeout 등으로 작업을 계속할 수 없으면 [AGENT_RULES.md](AGENT_RULES.md) §14.1의 continuity 규칙에 따라 Aide가 사용자 승인 범위 안에서 이어갈 수 있다. 복구 후에는 조건부 GitHub network access가 닫혔는지 확인하고 정상 역할 분리로 복귀한다.
 
 ## 7. Review Mode
 Aide 결과를 요구사항 충족, 구조적 부작용, 테스트 근거, 안전 경계, 과도한 변경, Rollback 가능성 기준으로 검토한다. 단순 취향 차이는 Reject 사유가 아니다.

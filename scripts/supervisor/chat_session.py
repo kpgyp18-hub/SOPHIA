@@ -494,10 +494,24 @@ class ChatSession:
     def _send(agent: ChatAgent, target: str, prompt: str, *, context: str | None = None) -> str:
         try:
             if context is None:
-                return agent.send(f"chat-{target.lower()}", prompt)
-            return agent.send(f"chat-{target.lower()}", prompt, context=context)
+                reply = agent.send(f"chat-{target.lower()}", prompt)
+            else:
+                reply = agent.send(f"chat-{target.lower()}", prompt, context=context)
         except Exception as exc:  # noqa: BLE001 -- keep an adapter failure inside the REPL
+            # This internal signal, unlike reply text, cannot be forged by a
+            # model response. User steering is intentional interruption, not
+            # evidence that the provider is unavailable.
+            if not isinstance(exc, ChatAdapterInterrupted):
+                try:
+                    setattr(agent, "last_send_failed", True)
+                except (AttributeError, TypeError):
+                    pass
             return f"(error: {exc})"
+        try:
+            setattr(agent, "last_send_failed", False)
+        except (AttributeError, TypeError):
+            pass
+        return reply
 
     def _request(self, agent: ChatAgent, target: str, prompt: str, *, context: str | None = None) -> str:
         """Send once, then silently rehydrate a newly-reset remote session."""
@@ -540,7 +554,33 @@ class ChatSession:
         # The agent has already seen all turns that preceded this reply. Its own
         # reply need not be injected on the next resumed call.
         self._last_sent_index[target] = len(self.history)
+        if target == "Claude":
+            self._sync_codex_network_fallback()
         self._compact_history()
+
+    def _sync_codex_network_fallback(self) -> None:
+        """Open Codex networking only while the live Claude provider is unavailable."""
+        claude = self.agents.get("Claude")
+        codex = self.agents.get("Codex")
+        setter = getattr(codex, "set_network_access", None)
+        if not callable(setter):
+            return
+        unavailable = bool(getattr(claude, "last_send_failed", False))
+        if not setter(unavailable):
+            return
+        # set_network_access() resets the remote Codex session. Its next fresh
+        # turn must receive all retained local context, not only the delta.
+        self._last_sent_index["Codex"] = 0
+        if unavailable:
+            self.printer(
+                "System",
+                "Blanc unavailable: Aide workspace network enabled for approved GitHub fallback tasks",
+            )
+        else:
+            self.printer(
+                "System",
+                "Blanc recovered: Aide fallback network disabled and remote session reset",
+            )
 
     def _begin_task(self, message: str) -> None:
         begin = getattr(self.task_tracker, "begin", None)
