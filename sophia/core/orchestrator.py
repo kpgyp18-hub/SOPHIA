@@ -42,7 +42,12 @@ from sophia.core.adaptive import AdaptiveScoreStore, FailureMemory
 from sophia.runtime.maintenance import AutonomousMaintenance
 from sophia.runtime.retrieval import RetrievalRouter
 from sophia.skills import CatalogAdapter, CatalogLoader, SkillCandidateLearner
-from sophia.goals import GoalManager, PlanManager, TaskQueue
+from sophia.goals import (
+    ApprovalQueue, ArtifactTracker, AutonomyBudgetTracker, BackgroundHealthMonitor,
+    BackgroundRuntime, DeadlineManager, FailureBudgetManager, GoalManager,
+    HeartbeatManager, PlanManager, ProgressTracker, RecoveryManager, ResumeManager,
+    Scheduler, TaskLeaseManager, TaskQueue, Watchdog,
+)
 
 
 class SophiaCore:
@@ -74,7 +79,13 @@ class SophiaCore:
         self.database = database or DatabaseManager(root=self.telemetry_path.parent)
         self.goals = GoalManager(self.database)
         self.plans = PlanManager(self.database)
-        self.goal_queue = TaskQueue(self.plans)
+        self.approvals = ApprovalQueue(self.database, self.plans)
+        self.goal_queue = TaskQueue(self.plans, approval_granted=self.approvals.granted)
+        self.resume_manager = ResumeManager(self.database, self.plans, self.goals)
+        self.recovery_manager = RecoveryManager(self.resume_manager)
+        self.progress = ProgressTracker(self.goals, self.plans)
+        self.scheduler = Scheduler(self.database, self.plans, self.goal_queue)
+        self.deadlines = DeadlineManager(self.plans)
         self.session_id = f"session-{uuid4().hex}"
         self.context_compressor = ContextCompressor(self.database)
         self.context_manager = context_manager or ContextManager(
@@ -85,6 +96,17 @@ class SophiaCore:
         self.context_budget = ContextBudget()
         self.tools = ToolGateway(approval=approval)
         self.tool_registry = ToolRegistry(self.tools)
+        self.goal_leases = TaskLeaseManager(self.database, self.plans)
+        self.goal_heartbeats = HeartbeatManager(self.database, self.plans)
+        self.autonomy_budgets = AutonomyBudgetTracker(self.database, self.goals)
+        self.goal_watchdog = Watchdog(self.plans, self.goal_heartbeats)
+        self.background_runtime = BackgroundRuntime(
+            self.plans, self.tool_registry, self.goal_leases,
+            self.goal_heartbeats, self.autonomy_budgets,
+        )
+        self.background_health = BackgroundHealthMonitor()
+        self.artifacts = ArtifactTracker(self.database, self.tools.workspace)
+        self.failure_budgets = FailureBudgetManager(self.database, self.goals)
         self.workspace = WorkspaceManager(self.tools.workspace)
         self.judge = judge or RuleJudge()
         self.vision = VisionAdapter()

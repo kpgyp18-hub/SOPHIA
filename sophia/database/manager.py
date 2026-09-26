@@ -104,6 +104,27 @@ class DatabaseManager:
     def list_goal_tasks(self, goal_id: str) -> list[dict[str, Any]]:
         return self.selected().list_goal_tasks(goal_id)
 
+    def save_goal_runtime_record(self, kind: str, record_id: str, payload: dict[str, Any], *,
+                                 goal_id: str | None = None, task_id: str | None = None,
+                                 status: str | None = None) -> str:
+        backend = self.selected()
+        backend.save_goal_runtime_record(kind, record_id, payload, goal_id=goal_id,
+                                         task_id=task_id, status=status)
+        return backend.name
+
+    def get_goal_runtime_record(self, kind: str, record_id: str) -> dict[str, Any] | None:
+        return self.selected().get_goal_runtime_record(kind, record_id)
+
+    def list_goal_runtime_records(self, kind: str, *, goal_id: str | None = None,
+                                  task_id: str | None = None,
+                                  status: str | None = None) -> list[dict[str, Any]]:
+        return self.selected().list_goal_runtime_records(
+            kind, goal_id=goal_id, task_id=task_id, status=status,
+        )
+
+    def delete_goal_runtime_record(self, kind: str, record_id: str) -> None:
+        self.selected().delete_goal_runtime_record(kind, record_id)
+
     def status_lines(self) -> list[str]:
         return [f"{name.upper():<10} {'OK' if health.ok else 'DOWN'} {health.detail}" + (" pgvector=OK" if health.vector_ready else "") for name, health in self.health().items()]
 

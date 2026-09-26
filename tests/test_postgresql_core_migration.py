@@ -43,6 +43,7 @@ def test_postgresql_core_migration_contains_no_pgvector_dependency():
     assert any("runtime.goal_events" in statement for statement in CORE_SCHEMA_STATEMENTS)
     assert any("runtime.long_tasks" in statement for statement in CORE_SCHEMA_STATEMENTS)
     assert any("runtime.task_dependencies" in statement for statement in CORE_SCHEMA_STATEMENTS)
+    assert any("runtime.goal_runtime_records" in statement for statement in CORE_SCHEMA_STATEMENTS)
     assert any("system.checkpoints" in statement for statement in CORE_SCHEMA_STATEMENTS)
 
 

@@ -42,6 +42,8 @@ class SQLiteBackend:
             db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_long_tasks_goal_status ON sophia_long_tasks(goal_id, status, priority DESC)")
             db.execute("CREATE TABLE IF NOT EXISTS sophia_task_dependencies (task_id TEXT NOT NULL REFERENCES sophia_long_tasks(task_id) ON DELETE CASCADE, dependency_task_id TEXT NOT NULL REFERENCES sophia_long_tasks(task_id), PRIMARY KEY(task_id, dependency_task_id))")
             db.execute("CREATE TABLE IF NOT EXISTS sophia_long_task_events (event_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL REFERENCES sophia_long_tasks(task_id) ON DELETE CASCADE, event_type TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            db.execute("CREATE TABLE IF NOT EXISTS sophia_goal_runtime_records (kind TEXT NOT NULL, record_id TEXT NOT NULL, goal_id TEXT, task_id TEXT, status TEXT, payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id))")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_goal_runtime_lookup ON sophia_goal_runtime_records(kind, goal_id, task_id, status, updated_at)")
 
     def health(self) -> Health:
         try:
@@ -259,6 +261,55 @@ class SQLiteBackend:
         for task_id, dependency in dependency_rows:
             dependencies.setdefault(task_id, []).append(dependency)
         return [self._goal_task_record(row, dependencies.get(row[0], [])) for row in rows]
+
+    def save_goal_runtime_record(self, kind: str, record_id: str, payload: dict[str, Any], *,
+                                 goal_id: str | None = None, task_id: str | None = None,
+                                 status: str | None = None) -> None:
+        self.migrate()
+        now = payload.get("updated_at") or payload.get("created_at")
+        if not isinstance(now, str):
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+        created_at = payload.get("created_at") if isinstance(payload.get("created_at"), str) else now
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO sophia_goal_runtime_records(kind, record_id, goal_id, task_id, status, payload, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, record_id) DO UPDATE SET "
+                "goal_id=excluded.goal_id, task_id=excluded.task_id, status=excluded.status, "
+                "payload=excluded.payload, updated_at=excluded.updated_at",
+                (kind, record_id, goal_id, task_id, status,
+                 json.dumps(payload, ensure_ascii=False, sort_keys=True), created_at, now),
+            )
+
+    def get_goal_runtime_record(self, kind: str, record_id: str) -> dict[str, Any] | None:
+        self.migrate()
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload FROM sophia_goal_runtime_records WHERE kind = ? AND record_id = ?",
+                (kind, record_id),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def list_goal_runtime_records(self, kind: str, *, goal_id: str | None = None,
+                                  task_id: str | None = None,
+                                  status: str | None = None) -> list[dict[str, Any]]:
+        self.migrate()
+        query = "SELECT payload FROM sophia_goal_runtime_records WHERE kind = ?"
+        parameters: list[str] = [kind]
+        for column, value in (("goal_id", goal_id), ("task_id", task_id), ("status", status)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                parameters.append(value)
+        query += " ORDER BY created_at, record_id"
+        with self._connect() as db:
+            rows = db.execute(query, tuple(parameters)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def delete_goal_runtime_record(self, kind: str, record_id: str) -> None:
+        self.migrate()
+        with self._connect() as db:
+            db.execute("DELETE FROM sophia_goal_runtime_records WHERE kind = ? AND record_id = ?",
+                       (kind, record_id))
 
     @staticmethod
     def _skill_record(row: tuple[Any, ...]) -> dict[str, Any]:

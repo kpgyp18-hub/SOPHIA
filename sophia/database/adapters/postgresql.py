@@ -303,6 +303,64 @@ class PostgreSQLBackend:
             dependencies.setdefault(task_id, []).append(dependency)
         return [self._goal_task_record(row, dependencies.get(row[0], [])) for row in rows]
 
+    def save_goal_runtime_record(self, kind: str, record_id: str, payload: dict[str, Any], *,
+                                 goal_id: str | None = None, task_id: str | None = None,
+                                 status: str | None = None) -> None:
+        now = payload.get("updated_at") or payload.get("created_at")
+        if not isinstance(now, str):
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+        created_at = payload.get("created_at") if isinstance(payload.get("created_at"), str) else now
+        with self._connect() as db:
+            with db.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO runtime.goal_runtime_records(kind, record_id, goal_id, task_id, status, payload, created_at, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s) "
+                    "ON CONFLICT(kind, record_id) DO UPDATE SET goal_id=excluded.goal_id, "
+                    "task_id=excluded.task_id, status=excluded.status, payload=excluded.payload, "
+                    "updated_at=excluded.updated_at",
+                    (kind, record_id, goal_id, task_id, status,
+                     json.dumps(payload, ensure_ascii=False, sort_keys=True), created_at, now),
+                )
+            db.commit()
+
+    def get_goal_runtime_record(self, kind: str, record_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            with db.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM runtime.goal_runtime_records WHERE kind = %s AND record_id = %s",
+                    (kind, record_id),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+
+    def list_goal_runtime_records(self, kind: str, *, goal_id: str | None = None,
+                                  task_id: str | None = None,
+                                  status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT payload FROM runtime.goal_runtime_records WHERE kind = %s"
+        parameters: list[Any] = [kind]
+        for column, value in (("goal_id", goal_id), ("task_id", task_id), ("status", status)):
+            if value is not None:
+                query += f" AND {column} = %s"
+                parameters.append(value)
+        query += " ORDER BY created_at, record_id"
+        with self._connect() as db:
+            with db.cursor() as cursor:
+                cursor.execute(query, tuple(parameters))
+                rows = cursor.fetchall()
+        return [row[0] if isinstance(row[0], dict) else json.loads(row[0]) for row in rows]
+
+    def delete_goal_runtime_record(self, kind: str, record_id: str) -> None:
+        with self._connect() as db:
+            with db.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM runtime.goal_runtime_records WHERE kind = %s AND record_id = %s",
+                    (kind, record_id),
+                )
+            db.commit()
+
     @staticmethod
     def _skill_record(row: tuple[Any, ...]) -> dict[str, Any]:
         keys = ("skill_id", "name", "version", "owner", "risk", "status", "description", "skill_path", "metadata", "quality_score", "quality_samples")

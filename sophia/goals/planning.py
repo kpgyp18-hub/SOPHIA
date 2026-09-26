@@ -49,6 +49,8 @@ class GoalTask:
         risk = self.risk.upper()
         if risk not in {"R0", "R1", "R2", "R3", "R4"}:
             raise ValueError(f"unsupported task risk: {self.risk}")
+        if risk in {"R3", "R4"} and not self.approval_requirement:
+            raise ValueError("R3/R4 tasks require approval")
         if not 0 <= self.priority <= 100:
             raise ValueError("task priority must be between 0 and 100")
         dependencies = tuple(dict.fromkeys(item for item in self.dependencies if item))
@@ -93,14 +95,18 @@ class GoalTask:
 
 
 _TASK_TRANSITIONS: dict[GoalTaskStatus, frozenset[GoalTaskStatus]] = {
-    GoalTaskStatus.PENDING: frozenset({GoalTaskStatus.READY, GoalTaskStatus.BLOCKED, GoalTaskStatus.CANCELLED}),
-    GoalTaskStatus.READY: frozenset({GoalTaskStatus.RUNNING, GoalTaskStatus.COMPLETED, GoalTaskStatus.PAUSED, GoalTaskStatus.CANCELLED}),
+    GoalTaskStatus.PENDING: frozenset({GoalTaskStatus.READY, GoalTaskStatus.WAITING,
+                                       GoalTaskStatus.BLOCKED, GoalTaskStatus.CANCELLED}),
+    GoalTaskStatus.READY: frozenset({GoalTaskStatus.RUNNING, GoalTaskStatus.WAITING,
+                                     GoalTaskStatus.COMPLETED, GoalTaskStatus.PAUSED,
+                                     GoalTaskStatus.BLOCKED, GoalTaskStatus.CANCELLED}),
     GoalTaskStatus.RUNNING: frozenset({GoalTaskStatus.REVIEW, GoalTaskStatus.COMPLETED, GoalTaskStatus.FAILED, GoalTaskStatus.PAUSED}),
-    GoalTaskStatus.WAITING: frozenset({GoalTaskStatus.READY, GoalTaskStatus.BLOCKED, GoalTaskStatus.CANCELLED}),
+    GoalTaskStatus.WAITING: frozenset({GoalTaskStatus.PENDING, GoalTaskStatus.READY, GoalTaskStatus.PAUSED,
+                                       GoalTaskStatus.BLOCKED, GoalTaskStatus.CANCELLED}),
     GoalTaskStatus.BLOCKED: frozenset({GoalTaskStatus.PENDING, GoalTaskStatus.CANCELLED}),
     GoalTaskStatus.REVIEW: frozenset({GoalTaskStatus.COMPLETED, GoalTaskStatus.FAILED}),
     GoalTaskStatus.PAUSED: frozenset({GoalTaskStatus.PENDING, GoalTaskStatus.CANCELLED}),
-    GoalTaskStatus.COMPLETED: frozenset(), GoalTaskStatus.FAILED: frozenset(),
+    GoalTaskStatus.COMPLETED: frozenset(), GoalTaskStatus.FAILED: frozenset({GoalTaskStatus.PENDING}),
     GoalTaskStatus.CANCELLED: frozenset(),
 }
 
@@ -151,6 +157,18 @@ class PlanManager:
         )
         return updated
 
+    def retry(self, task_id: str) -> GoalTask:
+        task = self.get_task(task_id)
+        if task.status is not GoalTaskStatus.FAILED:
+            raise ValueError("only a failed task can be retried")
+        updated = replace(task, status=GoalTaskStatus.PENDING,
+                          updated_at=datetime.now(timezone.utc).isoformat())
+        self.database.save_goal_task(
+            updated.to_record(), event_type="task_retry",
+            event_payload={"from": GoalTaskStatus.FAILED.value, "to": GoalTaskStatus.PENDING.value},
+        )
+        return updated
+
     @staticmethod
     def _assert_acyclic(tasks: Mapping[str, GoalTask]) -> None:
         visiting: set[str] = set()
@@ -182,9 +200,11 @@ class PriorityManager:
 class TaskQueue:
     """Expose only dependency-, policy-, and resource-ready tasks."""
 
-    def __init__(self, plans: PlanManager, *, resource_available: Callable[[GoalTask], bool] | None = None) -> None:
+    def __init__(self, plans: PlanManager, *, resource_available: Callable[[GoalTask], bool] | None = None,
+                 approval_granted: Callable[[str], bool] | None = None) -> None:
         self.plans = plans
         self.resource_available = resource_available or (lambda _task: True)
+        self.approval_granted = approval_granted or (lambda _task_id: False)
 
     def ready(self, goal_id: str) -> list[GoalTask]:
         goal = self.plans.database.get_goal(goal_id)
@@ -200,12 +220,17 @@ class TaskQueue:
             for dependency in task.dependencies:
                 blocking_counts[dependency] += 1
         for task in tasks:
-            if task.status not in {GoalTaskStatus.PENDING, GoalTaskStatus.READY}:
+            if task.status not in {GoalTaskStatus.PENDING, GoalTaskStatus.READY, GoalTaskStatus.WAITING}:
                 continue
             dependencies_ready = all(by_id[item].status is GoalTaskStatus.COMPLETED for item in task.dependencies)
-            if not dependencies_ready or task.approval_requirement or not self.resource_available(task):
+            approval_ready = not task.approval_requirement or self.approval_granted(task.task_id)
+            if not dependencies_ready or not approval_ready:
                 continue
-            if task.status is GoalTaskStatus.PENDING:
+            if not self.resource_available(task):
+                if task.status in {GoalTaskStatus.PENDING, GoalTaskStatus.READY}:
+                    self.plans.transition(task.task_id, GoalTaskStatus.WAITING)
+                continue
+            if task.status in {GoalTaskStatus.PENDING, GoalTaskStatus.WAITING}:
                 task = self.plans.transition(task.task_id, GoalTaskStatus.READY)
             score = PriorityManager.score(task, goal_priority=int(goal["priority"]),
                                           blocking_count=blocking_counts[task.task_id])
