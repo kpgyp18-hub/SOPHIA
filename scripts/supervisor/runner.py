@@ -94,14 +94,31 @@ class Runner:
     def terminate(self, task_id: str, process: subprocess.Popen[str], grace_timeout: float = 5.0) -> None:
         try:
             if process.poll() is None:
-                process.terminate()
-                self._kill_windows_process_tree(process, force=False)
-                try:
-                    process.wait(timeout=grace_timeout)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    self._kill_windows_process_tree(process, force=True)
-                    process.wait()
+                if self._can_reap_tree(process):
+                    # Reap descendants *before* the wrapper dies. TerminateProcess on
+                    # cmd.exe re-parents its children, after which taskkill /T has no
+                    # tree left to walk: the real CLI process survives as an orphan and
+                    # keeps whatever it holds (e.g. Codex's thread-writer lock), so the
+                    # next turn's ``exec resume`` collides with it. Keeping the parent
+                    # alive is what lets /T reach the whole tree.
+                    self._kill_windows_process_tree(process, force=False)
+                    try:
+                        process.wait(timeout=grace_timeout)
+                    except subprocess.TimeoutExpired:
+                        # Graceful taskkill is advisory and console CLIs routinely
+                        # ignore it; /F is the only reliable reap.
+                        self._kill_windows_process_tree(process, force=True)
+                        process.kill()
+                        process.wait()
+                else:
+                    # No tree to reap (POSIX, or no pid to walk from): signal the
+                    # process directly, exactly as before.
+                    process.terminate()
+                    try:
+                        process.wait(timeout=grace_timeout)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
         finally:
             self.writer_lock.release_completed(task_id)
 
@@ -114,11 +131,19 @@ class Runner:
         return True
 
     @staticmethod
+    def _can_reap_tree(process: subprocess.Popen[str]) -> bool:
+        """Whether taskkill /T can actually walk this process's descendants. When it
+        can't, terminate() must stay the graceful step -- otherwise nothing signals
+        the process at all and cleanup degrades to a grace-period stall plus kill."""
+        return os.name == "nt" and bool(getattr(process, "pid", None))
+
+    @staticmethod
     def _kill_windows_process_tree(process: subprocess.Popen[str], *, force: bool) -> None:
         """process.terminate()/kill() only signal the direct child on Windows; CLI
         wrappers (claude.cmd/codex.cmd) spawn further processes that would otherwise
         be orphaned. taskkill /T reaps the whole tree; /F is added on the final,
-        post-grace-period escalation."""
+        post-grace-period escalation. Callers must invoke this while the wrapper is
+        still alive -- /T resolves descendants through live parentage."""
         if os.name != "nt":
             return
         pid = getattr(process, "pid", None)

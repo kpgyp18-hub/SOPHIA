@@ -197,7 +197,15 @@ class ChatAdapter:
         diagnostic = f"{stdout}\n{stderr}".lower()
         return (
             ("resume" in diagnostic or "session" in diagnostic or "thread" in diagnostic)
-            and any(marker in diagnostic for marker in ("not found", "does not exist", "unknown", "invalid"))
+            and any(marker in diagnostic for marker in (
+                "not found", "does not exist", "unknown", "invalid",
+                # A conversation still held open by another writer is just as
+                # unusable as a missing one: an earlier turn's CLI process
+                # outlived its timeout and never released the store. Retrying the
+                # same id only re-collides, so treat it as a dead identity and
+                # start a fresh conversation (ChatSession resends local context).
+                "active writer", "conflict", "already in use", "locked",
+            ))
         )
 
 

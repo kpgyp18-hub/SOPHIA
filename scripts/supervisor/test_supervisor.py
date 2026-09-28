@@ -181,6 +181,27 @@ class SupervisorRequirementsTests(unittest.TestCase):
             call(["taskkill", "/F", "/T", "/PID", "4321"], capture_output=True, check=False),
         ])
 
+    # 12b-ii. Ordering guard: the tree reap must run while the wrapper is still alive.
+    # Signalling the wrapper first re-parents its children, leaving taskkill /T nothing
+    # to walk -- the observed failure mode where an orphaned codex.exe outlived its
+    # timeout and kept holding its thread-writer lock, blocking every later resume.
+    def test_runner_reaps_process_tree_before_signalling_wrapper(self):
+        from scripts.supervisor import runner as runner_module
+        process = FakeProcess(terminate_exits=False, pid=4321)
+        wrapper_state_at_each_taskkill = []
+
+        def record(args, **kwargs):
+            wrapper_state_at_each_taskkill.append(
+                (args[1], process.terminated or process.killed))
+
+        with patch.object(runner_module.os, "name", "nt"), \
+                patch.object(runner_module.subprocess, "run", side_effect=record):
+            with self.assertRaises(Exception):
+                Runner(WriterLock()).wait("task-order", process, timeout=0.01)
+        # False on both: the wrapper was untouched at /T *and* at the /F escalation.
+        self.assertEqual(wrapper_state_at_each_taskkill, [("/T", False), ("/F", False)])
+        self.assertTrue(process.killed)
+
     # 12c. On non-Windows or when the process object has no pid (e.g. FakeProcess in
     # most tests), no taskkill is attempted; behavior stays exactly as before.
     def test_runner_timeout_skips_process_tree_kill_when_not_windows_or_no_pid(self):

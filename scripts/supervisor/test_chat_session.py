@@ -841,6 +841,23 @@ class ChatAdapterSessionTests(unittest.TestCase):
         self.assertEqual(adapter._session_id, "new")
         self.assertTrue(adapter.last_reset)
 
+    def test_thread_writer_conflict_is_treated_as_resume_failure(self) -> None:
+        """A thread still held open by another writer is as unusable as a missing
+        one: an earlier turn's CLI process outlived its timeout without releasing
+        the store. Retrying the same id only re-collides, so the adapter must drop
+        the identity and start fresh rather than re-resume it forever."""
+        runner = CapturedRunner([
+            (0, '{"type":"thread.started","thread_id":"old"}\n{"type":"item.completed","item":{"type":"agent_message","text":"first"}}', ""),
+            (1, "", "Error: thread/resume: thread/resume failed: thread old already has an active writer (code -32600)"),
+            (0, '{"type":"thread.started","thread_id":"new"}\n{"type":"item.completed","item":{"type":"agent_message","text":"recovered"}}', ""),
+        ])
+        adapter = CodexChatAdapter(runner, cwd="C:/work", executable_path="codex", show_progress=False)
+        adapter.send("a", "one")
+        self.assertEqual(adapter.send("a", "two"), "recovered")
+        self.assertNotIn("resume", runner.calls[2])
+        self.assertEqual(adapter._session_id, "new")
+        self.assertTrue(adapter.last_reset)
+
 
 if __name__ == "__main__":
     unittest.main()
