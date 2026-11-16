@@ -14,6 +14,7 @@ class SQLiteBackend:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._schema_ready = False
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,23 +45,40 @@ class SQLiteBackend:
             db.execute("CREATE TABLE IF NOT EXISTS sophia_long_task_events (event_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL REFERENCES sophia_long_tasks(task_id) ON DELETE CASCADE, event_type TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             db.execute("CREATE TABLE IF NOT EXISTS sophia_goal_runtime_records (kind TEXT NOT NULL, record_id TEXT NOT NULL, goal_id TEXT, task_id TEXT, status TEXT, payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(kind, record_id))")
             db.execute("CREATE INDEX IF NOT EXISTS idx_goal_runtime_lookup ON sophia_goal_runtime_records(kind, goal_id, task_id, status, updated_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_goal_runtime_by_goal ON sophia_goal_runtime_records(kind, goal_id, created_at, record_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_goal_runtime_by_task ON sophia_goal_runtime_records(kind, task_id, created_at, record_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_task_dependencies_dependency ON sophia_task_dependencies(dependency_task_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_long_tasks_parent ON sophia_long_tasks(parent_task_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_long_task_events_task ON sophia_long_task_events(task_id, event_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_sophia_skill_outcomes_skill ON sophia_skill_outcomes(skill_id, outcome_id DESC)")
+        self._schema_ready = True
+
+    def _ensure_schema(self) -> None:
+        """Run :meth:`migrate` at most once per backend instance.
+
+        See the PostgreSQL backend for the rationale: every read and write
+        replayed the whole idempotent DDL before doing any work.
+        """
+        if not self._schema_ready:
+            self.migrate()
 
     def health(self) -> Health:
         try:
-            self.migrate()
+            self._ensure_schema()
             with self._connect() as db:
                 db.execute("SELECT 1").fetchone()
             return Health(self.name, True, str(self.path), False)
         except sqlite3.Error as error:
+            self._schema_ready = False  # re-migrate on recovery; the file may have been replaced
             return Health(self.name, False, str(error), False)
 
     def record(self, category: str, payload: dict[str, Any]) -> None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             db.execute("INSERT INTO sophia_events(category, payload) VALUES (?, ?)", (category, json.dumps(payload, ensure_ascii=False, sort_keys=True)))
 
     def export(self) -> list[dict[str, Any]]:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             rows = db.execute("SELECT category, payload, created_at FROM sophia_events ORDER BY id").fetchall()
         return [{"category": category, "payload": json.loads(payload), "created_at": created_at} for category, payload, created_at in rows]
@@ -70,7 +88,7 @@ class SQLiteBackend:
             self.record(str(record["category"]), dict(record["payload"]))
 
     def save_skill(self, skill: dict[str, Any]) -> None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             current = db.execute(
                 "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples "
@@ -100,7 +118,7 @@ class SQLiteBackend:
             )
 
     def get_skill(self, identifier: str, *, include_disabled: bool = False) -> dict[str, Any] | None:
-        self.migrate()
+        self._ensure_schema()
         query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples FROM sophia_skills WHERE (skill_id = ? OR name = ?)"
         parameters: tuple[str, ...] = (identifier, identifier)
         if not include_disabled:
@@ -110,7 +128,7 @@ class SQLiteBackend:
         return self._skill_record(row) if row else None
 
     def list_skills(self, *, status: str | None = "active") -> list[dict[str, Any]]:
-        self.migrate()
+        self._ensure_schema()
         query = "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples FROM sophia_skills"
         parameters: tuple[str, ...] = ()
         if status is not None:
@@ -123,7 +141,7 @@ class SQLiteBackend:
 
     def record_skill_outcome(self, skill_id: str, verdict: str, *, task_id: str | None = None,
                              reason: str | None = None, window: int = 20) -> tuple[float, int]:
-        self.migrate()
+        self._ensure_schema()
         normalized = verdict.upper()
         if normalized not in {"PASS", "FAIL", "UNCERTAIN"}:
             raise ValueError(f"unsupported skill verdict: {verdict}")
@@ -144,7 +162,7 @@ class SQLiteBackend:
         return score, len(rows)
 
     def skill_history(self, skill_id: str) -> list[dict[str, Any]]:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             rows = db.execute(
                 "SELECT skill_id, name, version, owner, risk, status, description, skill_path, metadata, quality_score, quality_samples "
@@ -153,7 +171,7 @@ class SQLiteBackend:
         return [self._skill_record(row) for row in rows]
 
     def save_context_summary(self, session_id: str, summary: str, *, metadata: dict[str, Any]) -> None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             db.execute(
                 "INSERT INTO sophia_session_summaries(session_id, summary, metadata) VALUES (?, ?, ?)",
@@ -161,7 +179,7 @@ class SQLiteBackend:
             )
 
     def load_context_summary(self, session_id: str) -> dict[str, Any] | None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             row = db.execute(
                 "SELECT summary, metadata FROM sophia_session_summaries WHERE session_id = ? ORDER BY summary_id DESC LIMIT 1",
@@ -173,7 +191,7 @@ class SQLiteBackend:
 
     def save_goal(self, goal: dict[str, Any], *, event_type: str,
                   event_payload: dict[str, Any]) -> None:
-        self.migrate()
+        self._ensure_schema()
         values = self._goal_values(goal)
         with self._connect() as db:
             db.execute(
@@ -192,13 +210,13 @@ class SQLiteBackend:
             )
 
     def get_goal(self, goal_id: str) -> dict[str, Any] | None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             row = db.execute(f"SELECT {self._GOAL_COLUMNS} FROM sophia_goals WHERE goal_id = ?", (goal_id,)).fetchone()
         return self._goal_record(row) if row else None
 
     def list_goals(self, *, status: str | None = None) -> list[dict[str, Any]]:
-        self.migrate()
+        self._ensure_schema()
         query = f"SELECT {self._GOAL_COLUMNS} FROM sophia_goals"
         parameters: tuple[str, ...] = ()
         if status is not None:
@@ -211,7 +229,7 @@ class SQLiteBackend:
 
     def save_goal_task(self, task: dict[str, Any], *, event_type: str,
                        event_payload: dict[str, Any]) -> None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             db.execute(
                 "INSERT INTO sophia_long_tasks(task_id, goal_id, parent_task_id, title, description, priority, status, required_skills, required_capabilities, risk, approval_requirement, deadline, retry_policy, checkpoint_policy, created_at, updated_at) "
@@ -234,7 +252,7 @@ class SQLiteBackend:
             )
 
     def get_goal_task(self, task_id: str) -> dict[str, Any] | None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             row = db.execute(f"SELECT {self._GOAL_TASK_COLUMNS} FROM sophia_long_tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
@@ -246,7 +264,7 @@ class SQLiteBackend:
         return self._goal_task_record(row, dependencies)
 
     def list_goal_tasks(self, goal_id: str) -> list[dict[str, Any]]:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             rows = db.execute(
                 f"SELECT {self._GOAL_TASK_COLUMNS} FROM sophia_long_tasks WHERE goal_id = ? ORDER BY created_at, task_id",
@@ -265,7 +283,7 @@ class SQLiteBackend:
     def save_goal_runtime_record(self, kind: str, record_id: str, payload: dict[str, Any], *,
                                  goal_id: str | None = None, task_id: str | None = None,
                                  status: str | None = None) -> None:
-        self.migrate()
+        self._ensure_schema()
         now = payload.get("updated_at") or payload.get("created_at")
         if not isinstance(now, str):
             from datetime import datetime, timezone
@@ -282,7 +300,7 @@ class SQLiteBackend:
             )
 
     def get_goal_runtime_record(self, kind: str, record_id: str) -> dict[str, Any] | None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             row = db.execute(
                 "SELECT payload FROM sophia_goal_runtime_records WHERE kind = ? AND record_id = ?",
@@ -293,7 +311,7 @@ class SQLiteBackend:
     def list_goal_runtime_records(self, kind: str, *, goal_id: str | None = None,
                                   task_id: str | None = None,
                                   status: str | None = None) -> list[dict[str, Any]]:
-        self.migrate()
+        self._ensure_schema()
         query = "SELECT payload FROM sophia_goal_runtime_records WHERE kind = ?"
         parameters: list[str] = [kind]
         for column, value in (("goal_id", goal_id), ("task_id", task_id), ("status", status)):
@@ -306,7 +324,7 @@ class SQLiteBackend:
         return [json.loads(row[0]) for row in rows]
 
     def delete_goal_runtime_record(self, kind: str, record_id: str) -> None:
-        self.migrate()
+        self._ensure_schema()
         with self._connect() as db:
             db.execute("DELETE FROM sophia_goal_runtime_records WHERE kind = ? AND record_id = ?",
                        (kind, record_id))

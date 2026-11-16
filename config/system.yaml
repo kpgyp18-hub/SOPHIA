@@ -37,6 +37,10 @@ brains:
 database:
   active: postgresql
   fallback: sqlite
+  # 백엔드 선택 시 health probe를 재사용하는 창(초). 0으로 두면 모든 호출마다 probe한다.
+  # 이 창 안에서 active 백엔드가 죽으면 드라이버 오류가 호출자에게 그대로 올라오고,
+  # 창이 지난 다음 probe에서 fallback으로 전환된다. (sophia/database/manager.py 참고)
+  health_cache_seconds: 5.0
   backends:
     postgresql:
       host: localhost

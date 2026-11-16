@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,38 @@ class DatabaseManager:
             "postgresql": PostgreSQLBackend(dict(backends.get("postgresql", {}))),
             "sqlite": SQLiteBackend(backends.get("sqlite", {}).get("path", Path(root) / "sophia.db")),
         }
+        self.health_cache_seconds = float(data.get("health_cache_seconds", 5.0))
+        self._selection: tuple[DatabaseBackend, float] | None = None
 
     def health(self) -> dict[str, Health]:
+        self._selection = None  # an explicit health check is also a request to re-select
         return {name: backend.health() for name, backend in self.backends.items()}
 
     def selected(self) -> DatabaseBackend:
+        """Return the backend to use, re-probing at most once per cache window.
+
+        Every method on this class calls this, and each probe is a round trip to
+        the server, so an uncached probe doubled the connection count of every
+        single read and write. The window bounds how long a backend that has
+        just failed keeps being handed out: within it the adapter raises the
+        driver error to the caller, and the next probe after it fails over.
+
+        That is narrower than the previous behaviour, not wider. Probing on
+        every call meant a mid-operation outage could silently reroute part of
+        a sequence of writes to SQLite with nothing in the return value saying
+        the destination had changed.
+        """
+        cached = self._selection
+        if cached is not None and (time.monotonic() - cached[1]) < self.health_cache_seconds:
+            return cached[0]
+        backend = self._select()
+        # Stamp after the probe, not before: the first probe runs the migration
+        # and can itself outlast the window, which would expire the entry on
+        # arrival and make the cache do nothing.
+        self._selection = (backend, time.monotonic())
+        return backend
+
+    def _select(self) -> DatabaseBackend:
         preferred = self.backends.get(self.active)
         if preferred is not None and preferred.health().ok:
             return preferred
@@ -148,6 +176,7 @@ class DatabaseManager:
         if target not in self.backends:
             raise ValueError(f"unknown backend: {target}")
         source = self.selected()
+        self._selection = None  # this call reassigns self.active; do not serve a stale choice
         target_backend = self.backends[target]
         if source is target_backend:
             target_backend.migrate()

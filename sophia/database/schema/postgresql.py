@@ -48,6 +48,28 @@ CORE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS runtime_handoffs_task_idx ON runtime.handoffs(task_id)",
     "CREATE INDEX IF NOT EXISTS memory_memories_project_idx ON memory.memories(project_id)",
     "CREATE INDEX IF NOT EXISTS telemetry_token_usage_task_idx ON telemetry.token_usage(task_id)",
+    # Each index below serves one named query or one foreign key. An unindexed
+    # referencing column makes every parent DELETE sequentially scan the child
+    # table to enforce the constraint, so the FK indexes are not speculative.
+    # runtime_goal_records_lookup_idx leads with (kind, goal_id), which cannot
+    # seek on a task_id-only filter and does not cover ORDER BY created_at.
+    # These two match list_goal_runtime_records' actual shapes and return rows
+    # already ordered, removing the sort. They make the older 5-column index
+    # redundant; dropping it is a separate call because it mutates a live index.
+    "CREATE INDEX IF NOT EXISTS runtime_goal_records_by_goal_idx ON runtime.goal_runtime_records(kind, goal_id, created_at, record_id)",
+    "CREATE INDEX IF NOT EXISTS runtime_goal_records_by_task_idx ON runtime.goal_runtime_records(kind, task_id, created_at, record_id)",
+    # FK + reverse dependency lookup; also what makes long_tasks deletable.
+    "CREATE INDEX IF NOT EXISTS runtime_task_dependencies_dependency_idx ON runtime.task_dependencies(dependency_task_id)",
+    # Self-referencing FK on long_tasks.
+    "CREATE INDEX IF NOT EXISTS runtime_long_tasks_parent_idx ON runtime.long_tasks(parent_task_id)",
+    # Audit trail written on every task transition; goal_events already had one.
+    "CREATE INDEX IF NOT EXISTS runtime_long_task_events_task_idx ON runtime.long_task_events(task_id, event_id)",
+    # load_context_summary: WHERE session_id = %s ORDER BY summary_id DESC LIMIT 1.
+    "CREATE INDEX IF NOT EXISTS runtime_session_summaries_session_idx ON runtime.session_summaries(session_id, summary_id DESC)",
+    # record_skill_outcome: WHERE skill_id = %s ORDER BY outcome_id DESC LIMIT %s.
+    "CREATE INDEX IF NOT EXISTS memory_skill_outcomes_skill_idx ON memory.skill_outcomes(skill_id, outcome_id DESC)",
+    # FK behind memory.documents ON DELETE CASCADE.
+    "CREATE INDEX IF NOT EXISTS memory_chunks_document_idx ON memory.chunks(document_id)",
 )
 
 
