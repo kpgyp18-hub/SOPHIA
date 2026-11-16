@@ -11,7 +11,16 @@ from .chat_adapter import (
     _read_codex_default_model,
     format_resolved_model,
 )
-from .chat_session import ChatSession, StreamPrinter, Turn, _addressed_agent, build_prompt, format_history_block, parse_input
+from .chat_session import (
+    _REMOTE_INPUT_RESET_TOKENS,
+    ChatSession,
+    StreamPrinter,
+    Turn,
+    _addressed_agent,
+    build_prompt,
+    format_history_block,
+    parse_input,
+)
 from .stream_text import ChatFragment
 from .timing import TurnTiming
 from .usage import TokenUsage
@@ -392,6 +401,39 @@ class ChatSessionTests(unittest.TestCase):
         session.handle_line("after compaction")
         self.assertIn("Earlier conversation, condensed", claude.calls[-1])
         self.assertIn("message 0", claude.calls[-1])
+
+    def test_compact_command_resets_remote_sessions_but_retains_local_history(self) -> None:
+        session, claude, codex = self._session()
+        session.handle_line("keep this decision")
+
+        session.handle_line("/compact")
+        session.handle_line("continue")
+
+        self.assertEqual((claude.reset_calls, codex.reset_calls), (1, 1))
+        self.assertIn("keep this decision", claude.calls[-1])
+
+    def test_heavy_remote_context_resets_and_rehydrates_on_next_turn(self) -> None:
+        class HeavyAgent(FakeAgent):
+            def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
+                reply = super().send(task_id, prompt, context=context)
+                self.last_usage = TokenUsage(input_tokens=_REMOTE_INPUT_RESET_TOKENS)
+                return reply
+
+        output: list[tuple[str, str]] = []
+        claude, codex = HeavyAgent("Claude", "heavy reply"), FakeAgent("Codex")
+        session = ChatSession(
+            {"Claude": claude, "Codex": codex}, default_agent="Claude",
+            printer=lambda speaker, text: output.append((speaker, text)),
+        )
+
+        session.handle_line("first message")
+        self.assertEqual(claude.reset_calls, 1)
+        self.assertEqual(session._last_sent_index["Claude"], 0)
+        self.assertTrue(any("remote context compacted" in text for _speaker, text in output))
+
+        session.handle_line("second message")
+        self.assertIn("first message", claude.calls[-1])
+        self.assertIn("heavy reply", claude.calls[-1])
 
     def test_clear_resets_history_and_agent_sessions(self) -> None:
         session, claude, codex = self._session()

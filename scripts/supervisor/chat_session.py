@@ -38,6 +38,10 @@ _MAX_SUMMARY_CHARS = 6000
 # discard that remote state after local compaction so the bounded local summary
 # is the only context rehydrated on the next turn.
 _COMPRESSION_RESET_EVICTIONS = 8
+# Codex resume threads can retain far more provider-side context than the
+# bounded local transcript. Reset before that hidden state grows into multi-
+# minute resumes; the next turn is rehydrated from the local compacted context.
+_REMOTE_INPUT_RESET_TOKENS = 150_000
 _PERSONA_CONTEXT = {
     "Claude": ("블랑", "personas/blanc_persona.txt"),
     "Codex": ("에이드", "personas/ade_persona.txt"),
@@ -52,6 +56,7 @@ _HELP_TEXT = (
     "/attach clear (discard pending files), "
     "/run <message> (send an explicit task to the current default agent), "
     "/steer <instruction> (while a request is running, stop and restart it with this instruction), "
+    "/compact (reset remote sessions but retain bounded local context), "
     "/clear (wipe local transcript and remote sessions), /exit or /quit, /help\n"
     "mention @claude/@블랑, @codex/@에이드, or @both to address a specific agent for one message. "
     "While an agent is working, new lines are accepted and queued in order. "
@@ -296,6 +301,9 @@ class ChatSession:
                 if callable(reset):
                     reset()
             self.printer("System", "local transcript and remote sessions cleared (log file is untouched)")
+        elif name == "compact":
+            self._reset_remote_sessions_for_compression()
+            self.printer("System", "remote sessions compacted; bounded local context will be restored next turn")
         elif name == "run":
             if not rest.strip():
                 self.printer("System", "usage: /run <message>")
@@ -557,6 +565,26 @@ class ChatSession:
         if target == "Claude":
             self._sync_codex_network_fallback()
         self._compact_history()
+        self._reset_heavy_remote_session(target)
+
+    def _reset_heavy_remote_session(self, target: str) -> None:
+        """Drop oversized provider state while retaining bounded local context."""
+        agent = self.agents[target]
+        usage = getattr(agent, "last_usage", None)
+        if not isinstance(usage, TokenUsage) or usage.input_tokens < _REMOTE_INPUT_RESET_TOKENS:
+            return
+        # History compaction may already have reset every remote session.
+        if self._last_sent_index.get(target, 0) == 0:
+            return
+        reset = getattr(agent, "reset_session", None)
+        if not callable(reset):
+            return
+        reset()
+        self._last_sent_index[target] = 0
+        self.printer(
+            "System",
+            f"{target}: remote context compacted after {usage.input_tokens:,} input tokens",
+        )
 
     def _sync_codex_network_fallback(self) -> None:
         """Open Codex networking only while the live Claude provider is unavailable."""
