@@ -5,6 +5,8 @@ import json
 import math
 import re
 import sqlite3
+from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
@@ -21,6 +23,27 @@ CONSOLIDATION_SIMILARITY = 0.80
 
 class Embedder(Protocol):
     def embed(self, text: str) -> list[float]: ...
+
+
+@dataclass(frozen=True)
+class MemoryExportRecord:
+    """Immutable projection of an active memory for a one-way export."""
+
+    id: int
+    task_id: str
+    text: str
+    source_type: str
+    source_id: str | None
+    session_id: str | None
+    supervisor: str | None
+    brain: str | None
+    provider: str | None
+    confidence: float
+    trust_level: str
+    importance: float
+    created_at: str | None
+    updated_at: str | None
+    version: int
 
 
 class ProjectMemory:
@@ -137,6 +160,42 @@ class ProjectMemory:
                 db.executemany("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
                                [(now, entry_id) for entry_id, _text in selected])
         return [text for _entry_id, text in selected]
+
+    def snapshot_for_export(self, *, memory_ids: Collection[int] | None = None,
+                            include_all: bool = False) -> tuple[MemoryExportRecord, ...]:
+        """Return a deterministic, read-only snapshot of active memories.
+
+        Selection must be explicit.  This method intentionally avoids the
+        access accounting performed by ``search`` and never reads the archive.
+        """
+        if include_all == (memory_ids is not None):
+            raise ValueError("provide memory_ids or set include_all=True, but not both")
+        requested: set[int] | None = None
+        if memory_ids is not None:
+            identifiers = tuple(memory_ids)
+            if not identifiers:
+                raise ValueError("memory_ids must not be empty")
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in identifiers):
+                raise ValueError("memory_ids must contain positive integers")
+            requested = set(identifiers)
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id, task_id, text, source_type, source_id, session_id, supervisor, brain, provider, "
+                "confidence, trust_level, importance, created_at, updated_at, version "
+                "FROM memories ORDER BY id"
+            ).fetchall()
+        if requested is not None:
+            rows = [row for row in rows if int(row[0]) in requested]
+            missing = sorted(requested - {int(row[0]) for row in rows})
+            if missing:
+                raise KeyError(f"memory ids not found: {', '.join(map(str, missing))}")
+        return tuple(MemoryExportRecord(
+            id=int(row[0]), task_id=str(row[1] or ""), text=str(row[2]), source_type=str(row[3]),
+            source_id=row[4], session_id=row[5], supervisor=row[6], brain=row[7], provider=row[8],
+            confidence=float(row[9]), trust_level=str(row[10]), importance=float(row[11]),
+            created_at=row[12], updated_at=row[13], version=int(row[14]),
+        ) for row in rows)
 
     def consolidate(self) -> int:
         """Archive near-duplicate active memories behind a deterministic summary entry.
