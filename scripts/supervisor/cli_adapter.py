@@ -74,6 +74,7 @@ class CLIAdapter:
             raise
         finally:
             timing.end = time.monotonic()
+            timing.events = dict(getattr(self.runner, "last_events", None) or {})
             progress.stop()
             self.last_timing = timing
             self.timing_log.record(timing)

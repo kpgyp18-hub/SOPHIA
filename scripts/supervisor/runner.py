@@ -6,14 +6,40 @@ import queue
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 from .writer_lock import WriterLock
 
+# on_event(name, t_monotonic, detail): lifecycle events for patch 02 instrumentation.
+# Names: process_start, first_stdout, first_stderr, stdout_eof, stderr_eof, child_exit,
+# timeout (detail={"stage": ...}), cleanup_start, cleanup_end.  A sink must never raise
+# into the process lifecycle, so _emitter swallows its errors.
+EventSink = Callable[[str, float, Mapping[str, str]], None]
+
+
+def _emitter(sink: "EventSink | None", store: dict[str, float] | None = None) -> Callable[..., None]:
+    """Build emit(name, **detail). ``store`` keeps the first time each event name fired."""
+    def emit(name: str, **detail: str) -> None:
+        now = time.monotonic()
+        if store is not None:
+            store.setdefault(name, now)
+        if sink is None:
+            return
+        try:
+            sink(name, now, detail)
+        except Exception:
+            pass
+    return emit
+
+
 @dataclass
 class Runner:
     writer_lock: WriterLock
+    # First monotonic time of each lifecycle event in the most recent run_capture*
+    # call; adapters read it after the call so existing call signatures stay unchanged.
+    # Valid because WriterLock admits one writer at a time.
+    last_events: dict[str, float] = field(default_factory=dict)
 
     def start(self, task_id: str, command: Sequence[str], *, cwd: str | None = None, env: Mapping[str, str] | None = None, capture_output: bool = False) -> subprocess.Popen[str]:
         if not self.writer_lock.can_start_next(task_id):
@@ -28,25 +54,42 @@ class Runner:
         return process
 
     def run_capture(self, task_id: str, command: Sequence[str], *, input_text: str, cwd: str | None = None,
-                    env: Mapping[str, str] | None = None, timeout: float | None = None) -> tuple[int, str, str]:
+                    env: Mapping[str, str] | None = None, timeout: float | None = None,
+                    on_event: EventSink | None = None) -> tuple[int, str, str]:
+        self.last_events = {}
+        emit = _emitter(on_event, self.last_events)
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
+        emit("process_start")
         try:
             stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+            emit("child_exit")
             return process.returncode, stdout or "", stderr or ""
         except subprocess.TimeoutExpired:
+            emit("timeout", stage="hard_deadline")
+            emit("cleanup_start")
             self.terminate(task_id, process)
+            emit("cleanup_end")
             raise
         finally:
             self.writer_lock.release_completed(task_id)
 
     def run_capture_streaming(self, task_id: str, command: Sequence[str], *, input_text: str, cwd: str | None = None,
                               env: Mapping[str, str] | None = None, timeout: float | None = None,
-                              on_line: Callable[[str], None] | None = None) -> tuple[int, str, str]:
+                              on_line: Callable[[str], None] | None = None,
+                              on_event: EventSink | None = None) -> tuple[int, str, str]:
         """Like run_capture, but invokes on_line(line) as each stdout line arrives instead
         of blocking until the process exits. Used only for interactive --watch mode; the
-        default execute() path still uses the simpler, already-validated run_capture."""
+        default execute() path still uses the simpler, already-validated run_capture.
+
+        stderr is drained concurrently with stdout (a child that fills the stderr pipe
+        would otherwise block in write() and stall stdout until the turn deadline).
+        ``on_event(name, t_monotonic, detail)`` receives lifecycle events; see _emitter."""
+        self.last_events = {}
+        emit = _emitter(on_event, self.last_events)
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
+        emit("process_start")
         line_queue: queue.Queue[str | None] = queue.Queue()
+        err_chunks: list[str] = []
 
         def reader() -> None:
             try:
@@ -54,14 +97,28 @@ class Runner:
                 for line in process.stdout:
                     line_queue.put(line)
             finally:
+                emit("stdout_eof")
                 line_queue.put(None)
 
+        def err_reader() -> None:
+            try:
+                if process.stderr is None:
+                    return
+                for chunk in process.stderr:
+                    if not err_chunks:
+                        emit("first_stderr")
+                    err_chunks.append(chunk)
+            finally:
+                emit("stderr_eof")
+
         reader_thread = threading.Thread(target=reader, daemon=True)
+        err_thread = threading.Thread(target=err_reader, daemon=True)
         try:
+            reader_thread.start()
+            err_thread.start()
             if process.stdin is not None:
                 process.stdin.write(input_text)
                 process.stdin.close()
-            reader_thread.start()
             lines: list[str] = []
             deadline = None if timeout is None else time.monotonic() + timeout
             while True:
@@ -69,16 +126,22 @@ class Runner:
                 try:
                     item = line_queue.get(timeout=remaining)
                 except queue.Empty:
+                    emit("timeout", stage="hard_deadline")
+                    emit("cleanup_start")
                     self.terminate(task_id, process)
+                    emit("cleanup_end")
                     raise subprocess.TimeoutExpired(command, timeout)
                 if item is None:
                     break
+                if not lines:
+                    emit("first_stdout")
                 lines.append(item)
                 if on_line is not None:
                     on_line(item.rstrip("\n"))
             process.wait(timeout=5)
-            stderr = process.stderr.read() if process.stderr is not None else ""
-            return process.returncode, "".join(lines), stderr or ""
+            emit("child_exit")
+            err_thread.join(timeout=5)
+            return process.returncode, "".join(lines), "".join(err_chunks)
         finally:
             self.writer_lock.release_completed(task_id)
 

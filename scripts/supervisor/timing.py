@@ -33,6 +33,8 @@ class TurnTiming:
     last_output: float | None = None
     outcome: str | None = None
     exit_code: int | None = None
+    # Runner lifecycle events (monotonic, same clock as ``start``); see Runner.last_events.
+    events: dict[str, float] = field(default_factory=dict)
     started_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
 
     @property
@@ -81,6 +83,7 @@ class TimingLog:
             "exit_code": timing.exit_code,
             "last_output_s": timing.last_output_s,
             "started_at": timing.started_at,
+            "events_s": {k: round(v - timing.start, 3) for k, v in timing.events.items()},
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
