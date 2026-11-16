@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -50,8 +51,9 @@ class CLIAdapter:
         try:
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:
+                    timing.last_output = time.monotonic()
                     if timing.first_output is None:
-                        timing.first_output = time.monotonic()
+                        timing.first_output = timing.last_output
                     progress.stop()
                     self.on_line(line)
 
@@ -61,7 +63,15 @@ class CLIAdapter:
             else:
                 code, stdout, stderr = self.runner.run_capture(str(task["step_id"]), self._command(task), input_text=prompt,
                                                                 cwd=self.cwd, timeout=self.timeout_seconds)
-                timing.first_output = time.monotonic()
+                timing.first_output = timing.last_output = time.monotonic()
+            timing.exit_code = code
+            timing.outcome = "completed" if code == 0 else "nonzero_exit"
+        except subprocess.TimeoutExpired:
+            timing.outcome = "timeout"
+            raise
+        except BaseException:
+            timing.outcome = "error"
+            raise
         finally:
             timing.end = time.monotonic()
             progress.stop()

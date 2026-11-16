@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import threading
 import time
 import tomllib
@@ -148,8 +149,9 @@ class ChatAdapter:
         try:
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:
+                    timing.last_output = time.monotonic()
                     if timing.first_output is None:
-                        timing.first_output = time.monotonic()
+                        timing.first_output = timing.last_output
                     # Parse metadata (resolved model, session id) as each line
                     # arrives, ahead of the on-completion pass in send(), so a
                     # live-streamed title reflects it on this same turn.
@@ -158,13 +160,24 @@ class ChatAdapter:
                     if display:
                         self.on_line(line)
 
-                return self.runner.run_capture_streaming(
+                result = self.runner.run_capture_streaming(
                     task_id, command, input_text=prompt, cwd=self.cwd, timeout=self.timeout_seconds,
                     on_line=on_line_then_stop)
-            result = self.runner.run_capture(
-                task_id, command, input_text=prompt, cwd=self.cwd, timeout=self.timeout_seconds)
-            timing.first_output = time.monotonic()
+            else:
+                result = self.runner.run_capture(
+                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=self.timeout_seconds)
+                timing.first_output = timing.last_output = time.monotonic()
+            timing.exit_code = result[0]
+            with self._active_lock:
+                cancelled = task_id in self._cancelled_task_ids
+            timing.outcome = "cancelled" if cancelled else ("completed" if result[0] == 0 else "nonzero_exit")
             return result
+        except subprocess.TimeoutExpired:
+            timing.outcome = "timeout"
+            raise
+        except BaseException:
+            timing.outcome = "error"
+            raise
         finally:
             timing.end = time.monotonic()
             progress.stop()

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.supervisor.chat_adapter import ClaudeChatAdapter
 from scripts.supervisor.timing import TimingLog, TurnTiming
 
 
@@ -50,6 +52,55 @@ class TimingLogTests(unittest.TestCase):
             self.assertEqual(first["label"], "Claude")
             self.assertAlmostEqual(first["total_s"], 4.0)
             self.assertAlmostEqual(first["to_first_output_s"], 1.5)
+
+
+class TurnOutcomeFieldsTests(unittest.TestCase):
+    """Patch 02 (P0-B): outcome / exit_code / last_output_s / started_at."""
+
+    def test_row_carries_the_four_new_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "latency.jsonl"
+            timing = TurnTiming(label="Claude", start=10.0, first_output=11.0, end=20.0,
+                                last_output=12.5, outcome="timeout", exit_code=None)
+            TimingLog(path).record(timing)
+            row = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(row["outcome"], "timeout")
+            self.assertIsNone(row["exit_code"])
+            self.assertAlmostEqual(row["last_output_s"], 2.5)
+            self.assertRegex(row["started_at"], r"^\d{4}-\d{2}-\d{2}T")
+
+    def test_old_fields_are_unchanged(self) -> None:
+        timing = TurnTiming(label="Claude", start=0.0, first_output=1.0, end=3.0)
+        self.assertIsNone(timing.last_output_s)
+        self.assertIsNone(timing.outcome)
+        self.assertAlmostEqual(timing.total, 3.0)
+
+    def _adapter(self, runner) -> ClaudeChatAdapter:
+        return ClaudeChatAdapter(runner, cwd="C:/work", executable_path="claude", show_progress=False)
+
+    def test_adapter_classifies_completed_and_nonzero_exit(self) -> None:
+        class Runner:
+            def __init__(self, code): self.code = code
+            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+                return self.code, "", ""
+        for code, expected in ((0, "completed"), (3, "nonzero_exit")):
+            adapter = self._adapter(Runner(code))
+            adapter._run("t1", ["claude"], "hi")
+            self.assertEqual(adapter.last_timing.outcome, expected)
+            self.assertEqual(adapter.last_timing.exit_code, code)
+            self.assertIsNotNone(adapter.last_timing.last_output)
+
+    def test_adapter_classifies_timeout_and_other_errors(self) -> None:
+        class Runner:
+            def __init__(self, exc): self.exc = exc
+            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+                raise self.exc
+        for exc, expected in ((subprocess.TimeoutExpired(["claude"], 1), "timeout"), (RuntimeError("x"), "error")):
+            adapter = self._adapter(Runner(exc))
+            with self.assertRaises(type(exc)):
+                adapter._run("t1", ["claude"], "hi")
+            self.assertEqual(adapter.last_timing.outcome, expected)
+            self.assertIsNone(adapter.last_timing.exit_code)
 
 
 if __name__ == "__main__":

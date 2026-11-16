@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 # Below this gap, first output and completion are effectively simultaneous
@@ -26,10 +27,22 @@ class TurnTiming:
     start: float
     first_output: float | None = None
     end: float | None = None
+    # Patch 02 (P0-B): fields that let a timeout be told apart from a clean
+    # finish. ``outcome`` stays None until the adapter classifies the turn
+    # (completed / nonzero_exit / timeout / cancelled / error).
+    last_output: float | None = None
+    outcome: str | None = None
+    exit_code: int | None = None
+    started_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
 
     @property
     def to_first_output(self) -> float | None:
         return None if self.first_output is None else self.first_output - self.start
+
+    @property
+    def last_output_s(self) -> float | None:
+        """Seconds from start to the most recent output (silence before the end = end - this)."""
+        return None if self.last_output is None else self.last_output - self.start
 
     @property
     def total(self) -> float | None:
@@ -64,6 +77,10 @@ class TimingLog:
             "label": timing.label,
             "to_first_output_s": timing.to_first_output,
             "total_s": timing.total,
+            "outcome": timing.outcome,
+            "exit_code": timing.exit_code,
+            "last_output_s": timing.last_output_s,
+            "started_at": timing.started_at,
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
