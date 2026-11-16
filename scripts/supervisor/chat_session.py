@@ -531,12 +531,17 @@ class ChatSession:
             pass
         return reply
 
-    def _request(self, agent: ChatAgent, target: str, prompt: str, *, context: str | None = None) -> str:
+    def _request(self, agent: ChatAgent, target: str, prompt: str, *, context: str | None = None,
+                 deadline: tuple[float, float] | None = None) -> str:
         """Send once, then silently rehydrate a newly-reset remote session."""
-        budget = (ExecutionContract.start("live_chat", f"chat-{target.lower()}", uuid.uuid4().hex,
-                                          agent.timeout_seconds)
-                  if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" and isinstance(agent, ChatAdapter)
-                  else None)
+        budget = None
+        if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" and isinstance(agent, ChatAdapter):
+            if deadline is None:
+                budget = ExecutionContract.start("live_chat", f"chat-{target.lower()}",
+                                                 uuid.uuid4().hex, agent.timeout_seconds)
+            else:
+                budget = ExecutionContract("live_chat", f"chat-{target.lower()}",
+                                           uuid.uuid4().hex, *deadline)
         reply = self._send(agent, target, prompt, context=context, execution_contract=budget)
         if not getattr(agent, "last_reset", False):
             return reply
@@ -639,18 +644,19 @@ class ChatSession:
             complete(self._active_task_id)
         self._active_task_id = None
 
-    def send_to(self, target: str) -> None:
+    def send_to(self, target: str, *, deadline: tuple[float, float] | None = None) -> None:
         agent, prompt = self._prepare_request(target)
         self.printer("System", f"{target}: 요청 전송")
-        reply = self._request(agent, target, prompt)
+        reply = self._request(agent, target, prompt, deadline=deadline)
         self._complete_request(target, reply)
         self.printer("System", f"{target}: 응답 완료")
         self._print_timing(agent)
         self._print_usage(target, agent)
         if self.auto_relay_enabled:
-            self._maybe_relay(from_agent=target, reply=reply, hops=0)
+            self._maybe_relay(from_agent=target, reply=reply, hops=0, deadline=deadline)
 
-    def _maybe_relay(self, *, from_agent: str, reply: str, hops: int) -> None:
+    def _maybe_relay(self, *, from_agent: str, reply: str, hops: int,
+                     deadline: tuple[float, float] | None = None) -> None:
         """Continue only explicit, bounded handoffs between the two agents."""
         target = _addressed_agent(reply)
         if target is None or target == from_agent:
@@ -664,12 +670,13 @@ class ChatSession:
         agent, prompt = self._prepare_request(target)
         context = f"relay {hops + 1}/{_MAX_AUTO_RELAY_HOPS}"
         self.printer("System", f"auto-relay {hops + 1}/{_MAX_AUTO_RELAY_HOPS}: {from_agent} -> {target}")
-        next_reply = self._request(agent, target, prompt, context=context)
+        next_reply = self._request(agent, target, prompt, context=context, deadline=deadline)
         self._complete_request(target, next_reply)
         self.printer("System", f"{target}: 응답 완료")
         self._print_timing(agent)
         self._print_usage(target, agent)
-        self._maybe_relay(from_agent=target, reply=next_reply, hops=hops + 1)
+        self._maybe_relay(from_agent=target, reply=next_reply, hops=hops + 1,
+                          deadline=deadline)
 
     def handle_line(self, raw: str) -> bool:
         if not raw.strip():
@@ -684,6 +691,13 @@ class ChatSession:
         return self._dispatch(target)
 
     def _dispatch(self, target: str) -> bool:
+        deadline = None
+        if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1":
+            timeouts = [agent.timeout_seconds for agent in self.agents.values()
+                        if isinstance(agent, ChatAdapter)]
+            if timeouts:
+                start = time.monotonic()
+                deadline = (start, start + min(timeouts))
         if target == "Both":
             self.printer("System", "@both: Claude → Codex 순서로 진행 중")
             # Prepare each request immediately before dispatch.  This lets the
@@ -691,13 +705,13 @@ class ChatSession:
             # live output from interleaving across agents.
             for name in self.agents:
                 agent, prompt = self._prepare_request(name)
-                reply = self._request(agent, name, prompt)
+                reply = self._request(agent, name, prompt, deadline=deadline)
                 self._complete_request(name, reply)
                 self.printer("System", f"{name}: 응답 완료")
                 self._print_timing(agent)
                 self._print_usage(name, agent)
         else:
-            self.send_to(target)
+            self.send_to(target, deadline=deadline)
         self._complete_task()
         return True
 

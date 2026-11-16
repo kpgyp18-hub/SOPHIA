@@ -935,6 +935,54 @@ class ChatAdapterSessionTests(unittest.TestCase):
         self.assertIn("execution deadline exhausted", reply)
         self.assertEqual(len(runner.calls), 2)  # rehydration never launches a third child
 
+    def test_opt_in_deadline_is_shared_across_both_agents(self) -> None:
+        class SlowClaudeRunner(CapturedRunner):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+                result = super().run_capture(task_id, command, input_text=input_text,
+                                             cwd=cwd, timeout=timeout)
+                time.sleep(0.15)
+                return result
+
+        claude_runner = SlowClaudeRunner([
+            (0, '{"type":"result","result":"done","session_id":"c1"}', ""),
+        ])
+        codex_runner = CapturedRunner([])
+        claude = ClaudeChatAdapter(claude_runner, cwd="C:/work", executable_path="claude",
+                                   show_progress=False, timeout_seconds=0.1)
+        codex = CodexChatAdapter(codex_runner, cwd="C:/work", executable_path="codex",
+                                 show_progress=False, timeout_seconds=0.1)
+        session = ChatSession({"Claude": claude, "Codex": codex}, default_agent="Both",
+                              printer=lambda speaker, text: None, auto_relay_enabled=False)
+        with patch.dict("os.environ", {"SOPHIA_G2_DEADLINE_CONTRACT": "1"}):
+            session.handle_line("probe")
+        self.assertEqual(len(claude_runner.calls), 1)
+        self.assertEqual(len(codex_runner.calls), 0)
+        self.assertEqual(codex.last_timing.outcome, "timeout")
+
+    def test_opt_in_deadline_is_shared_with_auto_relay(self) -> None:
+        class SlowClaudeRunner(CapturedRunner):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+                result = super().run_capture(task_id, command, input_text=input_text,
+                                             cwd=cwd, timeout=timeout)
+                time.sleep(0.15)
+                return result
+
+        claude_runner = SlowClaudeRunner([
+            (0, '{"type":"result","result":"Codex에게: 확인해줘","session_id":"c1"}', ""),
+        ])
+        codex_runner = CapturedRunner([])
+        claude = ClaudeChatAdapter(claude_runner, cwd="C:/work", executable_path="claude",
+                                   show_progress=False, timeout_seconds=0.1)
+        codex = CodexChatAdapter(codex_runner, cwd="C:/work", executable_path="codex",
+                                 show_progress=False, timeout_seconds=0.1)
+        session = ChatSession({"Claude": claude, "Codex": codex}, default_agent="Claude",
+                              printer=lambda speaker, text: None)
+        with patch.dict("os.environ", {"SOPHIA_G2_DEADLINE_CONTRACT": "1"}):
+            session.handle_line("probe")
+        self.assertEqual(len(claude_runner.calls), 1)
+        self.assertEqual(len(codex_runner.calls), 0)
+        self.assertEqual(codex.last_timing.outcome, "timeout")
+
     def test_thread_writer_conflict_is_treated_as_resume_failure(self) -> None:
         """A thread still held open by another writer is as unusable as a missing
         one: an earlier turn's CLI process outlived its timeout without releasing
