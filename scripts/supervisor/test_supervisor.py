@@ -20,6 +20,8 @@ from scripts.supervisor.supervisor import Supervisor, _dry_run_adapters
 from scripts.supervisor.claude_adapter import ClaudeCLIAdapter
 from scripts.supervisor.codex_adapter import CodexCLIAdapter
 from scripts.supervisor.cli_adapter import CLIAdapterError
+from scripts.supervisor.model_budget import ModelBudget
+from scripts.supervisor.model_router import ModelRouter
 from unittest.mock import patch
 import subprocess
 
@@ -498,16 +500,23 @@ class CLIAdapterTests(unittest.TestCase):
         codex_runner = CapturedRunner([])
         claude = ClaudeCLIAdapter(claude_runner, timeout_seconds=0.1)
         codex = CodexCLIAdapter(codex_runner, timeout_seconds=0.1)
+        model_budget = ModelBudget()
         with tempfile.TemporaryDirectory() as directory, patch.dict(
                 "os.environ", {"SOPHIA_G2_DEADLINE_CONTRACT": "1"}):
             supervisor = Supervisor(Path(directory) / "runtime", Path(directory) / "skills",
-                                    {"CLAUDE": claude, "CODEX": codex})
+                                    {"CLAUDE": claude, "CODEX": codex},
+                                    model_router=ModelRouter(), model_budget=model_budget,
+                                    codex_feature_inputs={"*": {"complexity": "normal",
+                                                                "requires_reasoning": True,
+                                                                "task_type": "structured"}})
             state = supervisor.run("task-deadline", CLAUDE_CODEX)
             stored = supervisor.store.load_state("task-deadline")
-        self.assertEqual((state["status"], stored["status"]), ("FAILED", "FAILED"))
+        self.assertEqual((state["status"], stored["status"]), ("NEED_USER", "NEED_USER"))
         self.assertEqual(len(claude_runner.calls), 1)
         self.assertEqual(len(codex_runner.calls), 0)
-        self.assertEqual(codex.last_timing.outcome, "timeout")
+        self.assertIsNone(codex.last_timing)
+        self.assertEqual((model_budget.luna_calls, model_budget.terra_calls,
+                          model_budget.sol_calls), (0, 0, 0))
 
     # 43. Completed work prevents a second adapter invocation.
     def test_adapter_done_task_is_not_reinvoked(self):

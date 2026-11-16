@@ -72,6 +72,10 @@ class Supervisor:
 
         while True:
             step_id = f"{step_number:02d}-{current_role}"
+            if budget is not None and budget.remaining_s() <= 0:
+                return self._terminal(task_id, route, "NEED_USER",
+                                      "execution deadline exhausted before new step",
+                                      guard, current_agent, current_role, step_number)
             task = {"step_id": step_id, "agent": current_agent, "role": current_role,
                     "step_number": step_number, "step_total": len(route),
                     "required_skills": [], "input_paths": [], "output_path": "",
