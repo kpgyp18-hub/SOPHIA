@@ -76,7 +76,11 @@ class Supervisor:
                     return self._terminal(task_id, route, "NEED_USER", decision.reason, guard, current_agent, current_role, step_number)
                 if not self.model_budget.can_execute(decision.model_tier, global_budget_pass=self.global_budget_check(guard)):
                     return self._terminal(task_id, route, "NEED_USER", "global or model budget exhausted", guard, current_agent, current_role, step_number)
-                self.model_budget.record_call(decision.model_tier, str(features["prior_model"]))
+                try:
+                    self.model_budget.record_call(decision.model_tier, str(features["prior_model"]))
+                except RuntimeError as exc:
+                    # Patch 05: a refused budget must end the task, not leave its state RUNNING.
+                    return self._terminal(task_id, route, "NEED_USER", str(exc), guard, current_agent, current_role, step_number)
                 task["model_tier"] = decision.model_tier
                 task["task_features"] = features
                 emit_model(current_agent, decision.model_tier)

@@ -43,6 +43,20 @@ class ModelRouterTests(unittest.TestCase):
         budget = ModelBudget(max_luna_calls=1)
         self.assertFalse(budget.can_execute("LUNA", global_budget_pass=False)); budget.record_call("LUNA")
         self.assertFalse(budget.can_execute("LUNA", global_budget_pass=True))
+    def test_refused_escalation_leaves_every_counter_unchanged(self):
+        budget = ModelBudget(max_model_escalations=0)
+        with self.assertRaises(RuntimeError): budget.record_call("TERRA", "LUNA")
+        self.assertEqual((budget.terra_calls, budget.model_escalations), (0, 0))
+        budget.record_call("TERRA", "TERRA")  # not an escalation, still allowed
+        self.assertEqual((budget.terra_calls, budget.model_escalations), (1, 0))
+    def test_refused_budget_ends_the_task_instead_of_leaving_it_running(self):
+        adapter = FakeAdapter([{"status":"OK","step_id":"01-exec"}])
+        with tempfile.TemporaryDirectory() as directory:
+            supervisor = Supervisor(Path(directory)/"runtime", Path(directory)/"skills", {"CODEX": adapter}, model_router=self.router, model_budget=ModelBudget(max_model_escalations=0), codex_feature_inputs={"*": {"complexity":"normal", "requires_reasoning":True, "task_type":"structured"}})
+            state = supervisor.run("task-001", DIRECT_CODEX)
+            stored = supervisor.store.load_state("task-001")
+        self.assertEqual((state["status"], stored["status"], adapter.calls), ("NEED_USER", "NEED_USER", []))
+        self.assertEqual((supervisor.model_budget.terra_calls, supervisor.model_budget.model_escalations), (0, 0))
     def test_config_mapping_and_missing(self):
         config = ModelConfig.from_mapping({"codex":{"luna":"a","terra":"b","sol":"c"}})
         self.assertEqual(config.resolve("TERRA"), "b")

@@ -25,11 +25,13 @@ class ModelBudget:
     def record_call(self, tier: str, prior_model: str = "NONE") -> None:
         if not self.can_execute(tier, global_budget_pass=True):
             raise RuntimeError("model budget exhausted")
+        # Patch 05: check every limit before mutating, so a refused call leaves all counters unchanged.
+        escalating = _rank(tier) > _rank(prior_model)
+        if escalating and self.model_escalations >= self.max_model_escalations:
+            raise RuntimeError("model escalation budget exhausted")
         attribute = {"LUNA": "luna_calls", "TERRA": "terra_calls", "SOL": "sol_calls"}[tier]
         setattr(self, attribute, getattr(self, attribute) + 1)
-        if _rank(tier) > _rank(prior_model):
-            if self.model_escalations >= self.max_model_escalations:
-                raise RuntimeError("model escalation budget exhausted")
+        if escalating:
             self.model_escalations += 1
 
     def record_same_model_retry(self) -> bool:
