@@ -120,14 +120,20 @@ class ChatAdapter:
             self._cancelled_task_ids.add(task_id)
         return self.runner.cancel(task_id)
 
-    def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
+    def send(self, task_id: str, prompt: str, *, context: str | None = None,
+             execution_contract: ExecutionContract | None = None) -> str:
         self._turn_id = uuid.uuid4().hex
         self._last_attempt_id = None
         # G2 C rollout is opt-in. A resume-failure retry inherits this send's
         # original deadline instead of receiving another full timeout.
-        budget = (ExecutionContract.start("live_chat", task_id, uuid.uuid4().hex,
-                                          self.timeout_seconds)
-                  if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" else None)
+        if execution_contract is not None:
+            if execution_contract.surface != "live_chat" or execution_contract.task_id != task_id:
+                raise ValueError("execution contract does not match this chat task")
+            budget = execution_contract.next_attempt(uuid.uuid4().hex)
+        else:
+            budget = (ExecutionContract.start("live_chat", task_id, uuid.uuid4().hex,
+                                              self.timeout_seconds)
+                      if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" else None)
         self.last_reset = False
         self.last_usage = None
         self._binary = self._resolve_binary()

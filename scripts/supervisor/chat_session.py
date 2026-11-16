@@ -1,11 +1,13 @@
 """Interactive shared chat session with resumable, delta-based agent prompts."""
 from __future__ import annotations
 
+import os
 import sys
 import queue
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -13,7 +15,8 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .usage import TokenUsage
-from .chat_adapter import ChatAdapterInterrupted, format_resolved_model
+from .chat_adapter import ChatAdapter, ChatAdapterInterrupted, format_resolved_model
+from sophia.runtime.execution_contract import ExecutionContract
 
 _MENTION_TARGETS = {
     "claude": "Claude", "클로드": "Claude", "blanc": "Claude", "블랑": "Claude",
@@ -504,12 +507,14 @@ class ChatSession:
         set_agent_model(target, format_resolved_model(agent))
 
     @staticmethod
-    def _send(agent: ChatAgent, target: str, prompt: str, *, context: str | None = None) -> str:
+    def _send(agent: ChatAgent, target: str, prompt: str, *, context: str | None = None,
+              execution_contract: ExecutionContract | None = None) -> str:
         try:
+            kwargs = {"execution_contract": execution_contract} if execution_contract is not None and isinstance(agent, ChatAdapter) else {}
             if context is None:
-                reply = agent.send(f"chat-{target.lower()}", prompt)
+                reply = agent.send(f"chat-{target.lower()}", prompt, **kwargs)
             else:
-                reply = agent.send(f"chat-{target.lower()}", prompt, context=context)
+                reply = agent.send(f"chat-{target.lower()}", prompt, context=context, **kwargs)
         except Exception as exc:  # noqa: BLE001 -- keep an adapter failure inside the REPL
             # This internal signal, unlike reply text, cannot be forged by a
             # model response. User steering is intentional interruption, not
@@ -528,7 +533,11 @@ class ChatSession:
 
     def _request(self, agent: ChatAgent, target: str, prompt: str, *, context: str | None = None) -> str:
         """Send once, then silently rehydrate a newly-reset remote session."""
-        reply = self._send(agent, target, prompt, context=context)
+        budget = (ExecutionContract.start("live_chat", f"chat-{target.lower()}", uuid.uuid4().hex,
+                                          agent.timeout_seconds)
+                  if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" and isinstance(agent, ChatAdapter)
+                  else None)
+        reply = self._send(agent, target, prompt, context=context, execution_contract=budget)
         if not getattr(agent, "last_reset", False):
             return reply
 
@@ -537,7 +546,8 @@ class ChatSession:
         # and immediately establish the new session with all retained context.
         self._last_sent_index[target] = 0
         _, full_prompt = self._prepare_request(target)
-        return self._send(agent, target, full_prompt, context=context)
+        return self._send(agent, target, full_prompt, context=context,
+                          execution_contract=budget)
 
     def _print_timing(self, agent: ChatAgent) -> None:
         if not self.show_timing:
