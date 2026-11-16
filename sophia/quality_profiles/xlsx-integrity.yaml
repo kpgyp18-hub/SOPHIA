@@ -1,0 +1,14 @@
+schema_version: "1.0"
+quality_profile_id: quality.xlsx.integrity
+version: 1.0.0
+dimensions:
+  formula_integrity: 0.30
+  data_consistency: 0.25
+  lineage: 0.20
+  style_preservation: 0.10
+  grounding: 0.15
+minimum_pass: 0.85
+uncertain_band:
+  min: 0.75
+  max: 0.84
+hard_fail: [invalid_xml, broken_reference, silent_formula_replacement]

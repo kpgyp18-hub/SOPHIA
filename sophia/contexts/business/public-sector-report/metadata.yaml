@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.business.public-sector-report
+name: public-sector-report
+version: 1.0.0
+scope: business
+category: business
+trust: INTERNAL
+applies_to:
+  artifact_types: [hwpx]
+priority: 70
+max_tokens: 450
+triggers: [public, official, government, 공공]
+requires: [context.document.hwpx-report]
+conflicts_with: []
+status: active

@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.business.monthly-report
+name: monthly-report
+version: 1.0.0
+scope: business
+category: business
+trust: INTERNAL
+applies_to:
+  artifact_types: [xlsx, pptx, hwpx]
+priority: 65
+max_tokens: 420
+triggers: [monthly, month, 월간]
+requires: []
+conflicts_with: []
+status: active

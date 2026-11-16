@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.design.accessibility
+name: accessibility
+version: 1.0.0
+scope: domain
+category: design
+trust: INTERNAL
+applies_to:
+  artifact_types: [figma]
+priority: 75
+max_tokens: 360
+triggers: [accessibility, a11y, contrast]
+requires: []
+conflicts_with: []
+status: active

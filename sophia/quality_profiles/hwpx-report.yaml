@@ -1,0 +1,14 @@
+schema_version: "1.0"
+quality_profile_id: quality.hwpx.report
+version: 1.0.0
+dimensions:
+  structure: 0.25
+  formal_tone: 0.15
+  table_integrity: 0.20
+  grounding: 0.20
+  template_compliance: 0.20
+minimum_pass: 0.80
+uncertain_band:
+  min: 0.70
+  max: 0.79
+hard_fail: [invalid_xml, missing_required_section, corrupted_table]

@@ -1,0 +1,14 @@
+schema_version: "1.0"
+context_id: context.global.artifact-quality
+name: artifact-quality
+version: 1.0.0
+scope: global
+category: global
+trust: INTERNAL
+applies_to: {}
+priority: 100
+max_tokens: 300
+triggers: []
+requires: []
+conflicts_with: []
+status: active

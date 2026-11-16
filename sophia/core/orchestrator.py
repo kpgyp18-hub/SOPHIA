@@ -48,6 +48,7 @@ from sophia.goals import (
     HeartbeatManager, PlanManager, ProgressTracker, RecoveryManager, ResumeManager,
     Scheduler, TaskLeaseManager, TaskQueue, Watchdog,
 )
+from sophia.artifact_intelligence import ArtifactIntelligenceManager
 
 
 class SophiaCore:
@@ -113,7 +114,8 @@ class SophiaCore:
         self.skill_registry = SkillRegistry(self.database, library=self.telemetry_path.parent / "skills")
         self.skill_executor = SkillExecutor(self.skill_registry)
         self.skill_learner = SkillCandidateLearner(self.skill_registry)
-        self.catalog_loader = CatalogLoader()
+        self.artifact_intelligence = ArtifactIntelligenceManager(self.database)
+        self.catalog_loader = CatalogLoader(Path(__file__).resolve().parents[1] / "skill_catalog")
         self.catalog_adapter = CatalogAdapter(self.skill_registry, self.tool_registry)
         self.retrieval_router = RetrievalRouter()
         self.adaptive_scores = AdaptiveScoreStore()
@@ -134,6 +136,17 @@ class SophiaCore:
     def register_skill_handler(self, identifier: str, handler) -> None:
         """Register a host-owned skill handler; persisted procedures remain non-executable."""
         self.skill_executor.register_handler(identifier, handler)
+
+    def sync_artifact_intelligence(self) -> dict[str, int]:
+        """Explicitly activate shipped context, quality, and skill definitions."""
+        context_count, quality_count = self.artifact_intelligence.sync()
+        skills = self.catalog_adapter.sync(self.catalog_loader)
+        return {
+            "contexts": context_count,
+            "quality_profiles": quality_count,
+            "skills": len(skills),
+            "workflows": len(self.artifact_intelligence.workflows),
+        }
 
     def _memory_search_worker(self, call: WorkerCall) -> list[str]:
         return self.memory.search(str(call.payload))

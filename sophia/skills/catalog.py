@@ -22,6 +22,7 @@ from sophia.skills.validator import SkillValidationError
 CATEGORIES = frozenset({"core", "development", "review", "planning", "ai", "security", "document", "git"})
 CATALOG_STATUSES = frozenset({"draft", "active", "deprecated"})
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SKILL_ID_RE = re.compile(r"^skill\.(document|design|business)\.[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.-]+)?$")
 _RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3, "R4": 4}
 
@@ -39,10 +40,11 @@ class CatalogDocument:
     status: str
     body: str
     source_hash: str
+    declared_skill_id: str | None = None
 
     @property
     def skill_id(self) -> str:
-        return f"catalog:{self.category}/{self.name}"
+        return self.declared_skill_id or f"catalog:{self.category}/{self.name}"
 
 
 class CatalogLoader:
@@ -79,6 +81,9 @@ class CatalogLoader:
             raise SkillValidationError(f"invalid semantic version: {version}")
         if category not in CATEGORIES or status not in CATALOG_STATUSES:
             raise SkillValidationError(f"invalid catalog category/status: {category}/{status}")
+        declared_skill_id = metadata.get("skill_id")
+        if declared_skill_id is not None and not _SKILL_ID_RE.fullmatch(str(declared_skill_id)):
+            raise SkillValidationError(f"invalid declared skill_id: {declared_skill_id}")
         capabilities = self._strings(metadata["capability_tags"], "capability_tags")
         tools = self._strings(metadata["allowed_tools"], "allowed_tools")
         if not isinstance(metadata["requires_review"], bool):
@@ -87,6 +92,7 @@ class CatalogLoader:
             Path(path), name, version, str(metadata["description"]).strip(), category,
             capabilities, tools, metadata["requires_review"], status, parts[2].strip(),
             hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            str(declared_skill_id) if declared_skill_id is not None else None,
         )
 
     @staticmethod

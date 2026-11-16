@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.business.executive-report
+name: executive-report
+version: 1.0.0
+scope: business
+category: business
+trust: INTERNAL
+applies_to:
+  artifact_types: [pptx, hwpx]
+priority: 70
+max_tokens: 420
+triggers: [executive, management, decision]
+requires: []
+conflicts_with: []
+status: active

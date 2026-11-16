@@ -1,0 +1,16 @@
+schema_version: "1.0"
+context_id: context.data.data-quality
+name: data-quality
+version: 1.0.0
+scope: domain
+category: data
+trust: INTERNAL
+applies_to:
+  artifact_types: [xlsx, csv]
+  skills: [skill.document.xlsx-analyzer, skill.document.xlsx-quality-check, skill.document.xlsx-dashboard]
+priority: 75
+max_tokens: 500
+triggers: [xlsx, excel, data, analysis]
+requires: []
+conflicts_with: []
+status: active

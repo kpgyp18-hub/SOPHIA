@@ -1,0 +1,16 @@
+schema_version: "1.0"
+context_id: context.document.pptx-design
+name: pptx-design
+version: 1.0.0
+scope: domain
+category: document
+trust: INTERNAL
+applies_to:
+  artifact_types: [pptx]
+  skills: [skill.document.pptx-builder, skill.document.pptx-editor, skill.document.executive-deck, skill.document.lecture-deck]
+priority: 70
+max_tokens: 500
+triggers: [pptx, presentation, slide]
+requires: []
+conflicts_with: []
+status: active

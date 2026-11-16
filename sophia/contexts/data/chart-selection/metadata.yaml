@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.data.chart-selection
+name: chart-selection
+version: 1.0.0
+scope: domain
+category: data
+trust: INTERNAL
+applies_to:
+  artifact_types: [xlsx, pptx]
+priority: 60
+max_tokens: 300
+triggers: [chart, graph, trend, comparison]
+requires: []
+conflicts_with: []
+status: active

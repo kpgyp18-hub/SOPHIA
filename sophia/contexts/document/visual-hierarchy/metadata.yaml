@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.document.visual-hierarchy
+name: visual-hierarchy
+version: 1.0.0
+scope: domain
+category: document
+trust: INTERNAL
+applies_to:
+  artifact_types: [pptx]
+priority: 65
+max_tokens: 300
+triggers: [visual, hierarchy, slide]
+requires: [context.document.pptx-design]
+conflicts_with: []
+status: active

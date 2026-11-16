@@ -1,0 +1,16 @@
+schema_version: "1.0"
+context_id: context.document.hwpx-report
+name: hwpx-report
+version: 1.0.0
+scope: domain
+category: document
+trust: INTERNAL
+applies_to:
+  artifact_types: [hwpx]
+  skills: [skill.document.hwpx-report-builder, skill.document.hwpx-template-fill, skill.document.hwpx-official-report]
+priority: 70
+max_tokens: 450
+triggers: [hwpx, report, document]
+requires: []
+conflicts_with: []
+status: active

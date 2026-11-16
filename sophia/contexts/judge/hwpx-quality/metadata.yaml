@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.judge.hwpx-quality
+name: hwpx-quality
+version: 1.0.0
+scope: judge
+category: judge
+trust: INTERNAL
+applies_to:
+  artifact_types: [hwpx]
+priority: 80
+max_tokens: 400
+triggers: []
+requires: []
+conflicts_with: []
+status: active

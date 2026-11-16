@@ -1,0 +1,19 @@
+schema_version: "1.0"
+workflow_id: workflow.monthly-report
+version: 1.0.0
+steps:
+  - id: analyze
+    skill: skill.document.xlsx-analyzer
+    contexts: [context.data.data-quality, context.data.kpi-design]
+  - id: build_ppt
+    depends_on: [analyze]
+    skill: skill.document.executive-deck
+    contexts: [context.document.pptx-design, context.business.executive-report]
+  - id: build_hwpx
+    depends_on: [analyze]
+    skill: skill.document.hwpx-report-builder
+    contexts: [context.document.hwpx-report, context.business.monthly-report]
+  - id: validate
+    depends_on: [build_ppt, build_hwpx]
+    skill: skill.business.artifact-package-review
+    judge_contexts: [context.judge.pptx-quality, context.judge.hwpx-quality]

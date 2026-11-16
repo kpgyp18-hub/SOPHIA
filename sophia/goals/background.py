@@ -237,7 +237,8 @@ class ArtifactTracker:
         self.database, self.workspace = database, Path(workspace).resolve()
 
     def register(self, goal_id: str, task_id: str, path: str | Path, *, artifact_type: str,
-                 version: str, state: ArtifactState = ArtifactState.DRAFT) -> dict[str, Any]:
+                 version: str, state: ArtifactState = ArtifactState.DRAFT,
+                 provenance: tuple[dict[str, object], ...] = ()) -> dict[str, Any]:
         target = (self.workspace / path).resolve()
         if target != self.workspace and self.workspace not in target.parents:
             raise PermissionError("artifact path escapes workspace")
@@ -249,6 +250,7 @@ class ArtifactTracker:
             "artifact_id": f"artifact-{uuid4().hex[:12]}", "goal_id": goal_id,
             "task_id": task_id, "path": target.relative_to(self.workspace).as_posix(),
             "type": artifact_type, "version": version, "hash": digest,
+            "provenance": list(provenance),
             "status": state.value, "created_at": now, "updated_at": now,
         }
         self.database.save_goal_runtime_record(

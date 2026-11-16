@@ -1,0 +1,15 @@
+schema_version: "1.0"
+context_id: context.business.lecture
+name: lecture
+version: 1.0.0
+scope: business
+category: business
+trust: INTERNAL
+applies_to:
+  artifact_types: [pptx]
+priority: 60
+max_tokens: 360
+triggers: [lecture, course, teaching, 강의]
+requires: [context.document.pptx-design]
+conflicts_with: []
+status: active

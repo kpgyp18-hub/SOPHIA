@@ -1,0 +1,14 @@
+schema_version: "1.0"
+quality_profile_id: quality.figma.review
+version: 1.0.0
+dimensions:
+  component_consistency: 0.25
+  token_consistency: 0.20
+  accessibility: 0.25
+  responsive_behavior: 0.15
+  handoff_readiness: 0.15
+minimum_pass: 0.80
+uncertain_band:
+  min: 0.70
+  max: 0.79
+hard_fail: [missing_critical_state, missing_implementation_measurement]

@@ -1,0 +1,16 @@
+schema_version: "1.0"
+context_id: context.design.figma-review
+name: figma-review
+version: 1.0.0
+scope: domain
+category: design
+trust: INTERNAL
+applies_to:
+  artifact_types: [figma]
+  skills: [skill.design.figma-review, skill.design.figma-dev-handoff]
+priority: 70
+max_tokens: 450
+triggers: [figma, ui, component]
+requires: []
+conflicts_with: []
+status: active
