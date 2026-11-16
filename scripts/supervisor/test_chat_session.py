@@ -1,5 +1,6 @@
 import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -885,6 +886,30 @@ class ChatAdapterSessionTests(unittest.TestCase):
         self.assertNotIn("resume", runner.calls[2])
         self.assertEqual(adapter._session_id, "new")
         self.assertTrue(adapter.last_reset)
+
+    def test_opt_in_deadline_refuses_resume_retry_after_budget_expires(self) -> None:
+        class SlowResumeRunner(CapturedRunner):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+                result = super().run_capture(task_id, command, input_text=input_text,
+                                             cwd=cwd, timeout=timeout)
+                if len(self.calls) == 2:
+                    time.sleep(0.03)
+                return result
+
+        runner = SlowResumeRunner([
+            (0, '{"type":"thread.started","thread_id":"old"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"first"}}', ""),
+            (1, "", "thread old not found for resume"),
+        ])
+        adapter = CodexChatAdapter(runner, cwd="C:/work", executable_path="codex",
+                                   show_progress=False, timeout_seconds=10)
+        with patch.dict("os.environ", {"SOPHIA_G2_DEADLINE_CONTRACT": "1"}):
+            adapter.send("task", "first")
+            adapter.timeout_seconds = 0.01
+            with self.assertRaises(TimeoutError):
+                adapter.send("task", "second")
+        self.assertEqual(len(runner.calls), 2)  # no third subprocess attempt
+        self.assertEqual(adapter.last_timing.outcome, "timeout")
 
     def test_thread_writer_conflict_is_treated_as_resume_failure(self) -> None:
         """A thread still held open by another writer is as unusable as a missing

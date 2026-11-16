@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, Sequence
 
+from sophia.runtime.execution_contract import ExecutionContract
+
 from .completion import CompletionReport, reconcile_timeout
 from .progress import WaitProgress
 from .runner import Runner
@@ -121,13 +123,19 @@ class ChatAdapter:
     def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
         self._turn_id = uuid.uuid4().hex
         self._last_attempt_id = None
+        # G2 C rollout is opt-in. A resume-failure retry inherits this send's
+        # original deadline instead of receiving another full timeout.
+        budget = (ExecutionContract.start("live_chat", task_id, uuid.uuid4().hex,
+                                          self.timeout_seconds)
+                  if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" else None)
         self.last_reset = False
         self.last_usage = None
         self._binary = self._resolve_binary()
         was_resuming = self._session_id is not None
         self.last_completion_report = None
         try:
-            code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context)
+            code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context,
+                                             execution_contract=budget)
         except subprocess.TimeoutExpired as exc:
             report: CompletionReport | None = getattr(exc, "completion_report", None)
             if report is not None and report.recoverable:
@@ -157,7 +165,9 @@ class ChatAdapter:
             self.telemetry_reset_reason = "resume_failure"
             self.reset_session()
             self.last_reset = True
-            code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context, display=False)
+            retry_budget = budget.next_attempt(uuid.uuid4().hex) if budget else None
+            code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context,
+                                             display=False, execution_contract=retry_budget)
         if code != 0:
             diagnostic = (stderr.strip() or stdout.strip())[-800:]
             raise ChatAdapterError(f"{self.executable} CLI exited with code {code}: {diagnostic}")
@@ -169,19 +179,23 @@ class ChatAdapter:
         return extract_chat_final_text(stdout)
 
     def _run(self, task_id: str, command: Sequence[str], prompt: str, *, context: str | None = None,
-             display: bool = True) -> tuple[int, str, str]:
+             display: bool = True,
+             execution_contract: ExecutionContract | None = None) -> tuple[int, str, str]:
         with self._active_lock:
             self._active_task_id = task_id
         suffix = f" ({context})" if context else ""
         progress = WaitProgress(f"{self.display_name} 응답 대기 중{suffix}", enabled=self.show_progress)
         progress.start()
-        self._last_attempt_id = uuid.uuid4().hex
+        self._last_attempt_id = (execution_contract.attempt_id if execution_contract
+                                 else uuid.uuid4().hex)
         timing = TurnTiming(label=self.display_name, start=time.monotonic(),
                             turn_id=self._turn_id, attempt_id=self._last_attempt_id,
                             session_mode="resumed" if self._session_id else "new",
                             reset_reason=self.telemetry_reset_reason)
         self.telemetry_reset_reason = None
         try:
+            timeout = (execution_contract.require_remaining_s() if execution_contract
+                       else self.timeout_seconds)
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:
                     timing.last_output = time.monotonic()
@@ -196,11 +210,11 @@ class ChatAdapter:
                         self.on_line(line)
 
                 result = self.runner.run_capture_streaming(
-                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=self.timeout_seconds,
+                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=timeout,
                     on_line=on_line_then_stop)
             else:
                 result = self.runner.run_capture(
-                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=self.timeout_seconds)
+                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=timeout)
                 timing.first_output = timing.last_output = time.monotonic()
             timing.exit_code = result[0]
             with self._active_lock:
@@ -213,6 +227,9 @@ class ChatAdapter:
             timing.reconciliation = report.state
             self.last_completion_report = report
             exc.completion_report = report  # type: ignore[attr-defined]
+            raise
+        except TimeoutError:
+            timing.outcome = "timeout"
             raise
         except BaseException:
             timing.outcome = "error"
