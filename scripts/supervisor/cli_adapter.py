@@ -58,6 +58,7 @@ class CLIAdapter:
         try:
             timeout = (execution_contract.require_remaining_s() if execution_contract
                        else self.timeout_seconds)
+            runner_budget = {"deadline_at": execution_contract.deadline_at} if execution_contract else {}
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:
                     timing.last_output = time.monotonic()
@@ -68,10 +69,11 @@ class CLIAdapter:
 
                 code, stdout, stderr = self.runner.run_capture_streaming(
                     str(task["step_id"]), self._streaming_command(task), input_text=prompt,
-                    cwd=self.cwd, timeout=timeout, on_line=on_line_then_stop)
+                    cwd=self.cwd, timeout=timeout, on_line=on_line_then_stop, **runner_budget)
             else:
                 code, stdout, stderr = self.runner.run_capture(str(task["step_id"]), self._command(task), input_text=prompt,
-                                                                cwd=self.cwd, timeout=timeout)
+                                                                cwd=self.cwd, timeout=timeout,
+                                                                **runner_budget)
                 timing.first_output = timing.last_output = time.monotonic()
             timing.exit_code = code
             timing.outcome = "completed" if code == 0 else "nonzero_exit"

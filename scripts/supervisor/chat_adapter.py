@@ -202,6 +202,7 @@ class ChatAdapter:
         try:
             timeout = (execution_contract.require_remaining_s() if execution_contract
                        else self.timeout_seconds)
+            runner_budget = {"deadline_at": execution_contract.deadline_at} if execution_contract else {}
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:
                     timing.last_output = time.monotonic()
@@ -217,10 +218,11 @@ class ChatAdapter:
 
                 result = self.runner.run_capture_streaming(
                     task_id, command, input_text=prompt, cwd=self.cwd, timeout=timeout,
-                    on_line=on_line_then_stop)
+                    on_line=on_line_then_stop, **runner_budget)
             else:
                 result = self.runner.run_capture(
-                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=timeout)
+                    task_id, command, input_text=prompt, cwd=self.cwd, timeout=timeout,
+                    **runner_budget)
                 timing.first_output = timing.last_output = time.monotonic()
             timing.exit_code = result[0]
             with self._active_lock:

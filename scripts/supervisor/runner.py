@@ -1,6 +1,7 @@
 """The sole process lifecycle authority for Supervisor agents."""
 from __future__ import annotations
 
+import math
 import os
 import queue
 import subprocess
@@ -22,7 +23,8 @@ def _collect_partial(process: "subprocess.Popen[str]") -> tuple[str, str]:
 
 # on_event(name, t_monotonic, detail): lifecycle events for patch 02 instrumentation.
 # Names: process_start, first_stdout, first_stderr, stdout_eof, stderr_eof, child_exit,
-# timeout (detail={"stage": ...}), cleanup_start, cleanup_end.  A sink must never raise
+# timeout (detail={"stage": ...}), stdin_closed, cleanup_start, cleanup_end,
+# cleanup_incomplete. A sink must never raise
 # into the process lifecycle, so _emitter swallows its errors.
 EventSink = Callable[[str, float, Mapping[str, str]], None]
 
@@ -46,11 +48,15 @@ def _emitter(sink: "EventSink | None", store: dict[str, float] | None = None) ->
 class Runner:
     writer_lock: WriterLock
     # First monotonic time of each lifecycle event in the most recent run_capture*
-    # call; adapters read it after the call so existing call signatures stay unchanged.
+    # call; adapters read it after the call instead of changing the result tuple.
     # Valid because WriterLock admits one writer at a time.
     last_events: dict[str, float] = field(default_factory=dict)
+    # A failed bounded cleanup is not permission to start another child.
+    cleanup_pending: set[str] = field(default_factory=set)
 
     def start(self, task_id: str, command: Sequence[str], *, cwd: str | None = None, env: Mapping[str, str] | None = None, capture_output: bool = False) -> subprocess.Popen[str]:
+        if self.cleanup_pending:
+            raise RuntimeError("previous process cleanup is unverified; reconcile before retrying")
         if not self.writer_lock.can_start_next(task_id):
             raise RuntimeError("previous agent process has not exited")
         child_env = os.environ.copy()
@@ -64,7 +70,12 @@ class Runner:
 
     def run_capture(self, task_id: str, command: Sequence[str], *, input_text: str, cwd: str | None = None,
                     env: Mapping[str, str] | None = None, timeout: float | None = None,
-                    on_event: EventSink | None = None) -> tuple[int, str, str]:
+                    on_event: EventSink | None = None,
+                    deadline_at: float | None = None) -> tuple[int, str, str]:
+        if deadline_at is not None:
+            return self._run_deadline_capture(task_id, command, input_text=input_text,
+                                              cwd=cwd, env=env, deadline_at=deadline_at,
+                                              timeout=timeout, on_event=on_event)
         self.last_events = {}
         emit = _emitter(on_event, self.last_events)
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
@@ -86,7 +97,8 @@ class Runner:
     def run_capture_streaming(self, task_id: str, command: Sequence[str], *, input_text: str, cwd: str | None = None,
                               env: Mapping[str, str] | None = None, timeout: float | None = None,
                               on_line: Callable[[str], None] | None = None,
-                              on_event: EventSink | None = None) -> tuple[int, str, str]:
+                              on_event: EventSink | None = None,
+                              deadline_at: float | None = None) -> tuple[int, str, str]:
         """Like run_capture, but invokes on_line(line) as each stdout line arrives instead
         of blocking until the process exits. Used only for interactive --watch mode; the
         default execute() path still uses the simpler, already-validated run_capture.
@@ -94,6 +106,10 @@ class Runner:
         stderr is drained concurrently with stdout (a child that fills the stderr pipe
         would otherwise block in write() and stall stdout until the turn deadline).
         ``on_event(name, t_monotonic, detail)`` receives lifecycle events; see _emitter."""
+        if deadline_at is not None:
+            return self._run_deadline_capture(task_id, command, input_text=input_text,
+                                              cwd=cwd, env=env, deadline_at=deadline_at,
+                                              timeout=timeout, on_line=on_line, on_event=on_event)
         self.last_events = {}
         emit = _emitter(on_event, self.last_events)
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
@@ -156,6 +172,141 @@ class Runner:
             return process.returncode, "".join(lines), "".join(err_chunks)
         finally:
             self.writer_lock.release_completed(task_id)
+
+    def _run_deadline_capture(self, task_id: str, command: Sequence[str], *, input_text: str,
+                              cwd: str | None, env: Mapping[str, str] | None,
+                              deadline_at: float, timeout: float | None,
+                              on_line: Callable[[str], None] | None = None,
+                              on_event: EventSink | None = None) -> tuple[int, str, str]:
+        """One absolute execution deadline for startup, input, output and exit.
+
+        Pipe readers and the stdin writer run concurrently so a child which never
+        reads stdin cannot pin the controlling thread. Cleanup has its own bounded
+        budget; it never grants the child more execution time after expiry.
+        OS process creation itself is synchronous: if it returns late, the child
+        is reaped immediately without sending the prompt.
+        """
+        self.last_events = {}
+        emit = _emitter(on_event, self.last_events)
+        if not math.isfinite(deadline_at):
+            raise ValueError("execution deadline must be finite")
+        if timeout is not None:
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be positive and finite")
+            deadline_at = min(deadline_at, time.monotonic() + timeout)
+        if deadline_at <= time.monotonic():
+            emit("timeout", stage="before_process_start")
+            raise subprocess.TimeoutExpired(command, timeout, output="", stderr="")
+
+        process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
+        emit("process_start")
+        messages: queue.Queue[tuple[str, str | BaseException | None]] = queue.Queue()
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+
+        def read_pipe(pipe, channel: str, chunks: list[str]) -> None:
+            try:
+                for line in pipe:
+                    if not chunks:
+                        emit(f"first_{channel}")
+                    chunks.append(line)
+                    if channel == "stdout":
+                        messages.put(("line", line))
+            except Exception as exc:
+                messages.put(("error", exc))
+            finally:
+                pipe.close()
+                emit(f"{channel}_eof")
+                messages.put((channel, None))
+
+        def write_input() -> None:
+            try:
+                if time.monotonic() >= deadline_at:
+                    return
+                process.stdin.write(input_text)
+                process.stdin.close()
+                emit("stdin_closed")
+            except (BrokenPipeError, OSError):
+                # A provider can exit normally without consuming all input.
+                pass
+            except Exception as exc:
+                messages.put(("error", exc))
+            finally:
+                if not process.stdin.closed:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                messages.put(("stdin", None))
+
+        threads = [threading.Thread(target=read_pipe, args=(process.stdout, "stdout", out_chunks),
+                                    name=f"sophia-{task_id}-stdout", daemon=True),
+                   threading.Thread(target=read_pipe, args=(process.stderr, "stderr", err_chunks),
+                                    name=f"sophia-{task_id}-stderr", daemon=True),
+                   threading.Thread(target=write_input, name=f"sophia-{task_id}-stdin", daemon=True)]
+        started_threads: list[threading.Thread] = []
+        complete: set[str] = set()
+        try:
+            if deadline_at <= time.monotonic():
+                raise subprocess.TimeoutExpired(command, timeout)
+            for thread in threads:
+                thread.start()
+                started_threads.append(thread)
+            while True:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if complete == {"stdin", "stdout", "stderr"}:
+                    process.wait(timeout=remaining)
+                    emit("child_exit")
+                    return process.returncode, "".join(out_chunks), "".join(err_chunks)
+                try:
+                    kind, value = messages.get(timeout=remaining)
+                except queue.Empty:
+                    raise subprocess.TimeoutExpired(command, timeout) from None
+                if kind == "line":
+                    if on_line is not None:
+                        on_line(value.rstrip("\n"))
+                elif kind == "error":
+                    raise value
+                else:
+                    complete.add(kind)
+        except BaseException as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                emit("timeout", stage="hard_deadline")
+            emit("cleanup_start")
+            try:
+                self._cleanup_deadline_process(process, started_threads)
+            except BaseException as cleanup_error:
+                self.cleanup_pending.add(task_id)
+                emit("cleanup_incomplete")
+                raise RuntimeError("process cleanup unverified; do not retry") from cleanup_error
+            emit("cleanup_end")
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise subprocess.TimeoutExpired(command, timeout, output="".join(out_chunks),
+                                                stderr="".join(err_chunks)) from exc
+            raise
+        finally:
+            self.writer_lock.release_completed(task_id)
+
+    def _cleanup_deadline_process(self, process: subprocess.Popen[str],
+                                  threads: list[threading.Thread], cleanup_s: float = 5.0) -> None:
+        """Reap first, then join pipe threads, all within one cleanup budget."""
+        cleanup_at = time.monotonic() + cleanup_s
+        if process.poll() is None:
+            if self._can_reap_tree(process):
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                               capture_output=True, check=False, timeout=cleanup_s)
+            else:
+                process.kill()
+            process.wait(timeout=max(0.0, cleanup_at - time.monotonic()))
+        for thread in threads:
+            thread.join(timeout=max(0.0, cleanup_at - time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
+            raise TimeoutError("pipe cleanup did not finish")
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
 
     def wait(self, task_id: str, process: subprocess.Popen[str], timeout: float | None = None) -> int:
         try:

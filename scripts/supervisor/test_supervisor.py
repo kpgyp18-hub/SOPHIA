@@ -386,7 +386,7 @@ class CapturedRunner:
         self.responses = list(responses)
         self.calls = []
 
-    def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+    def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None, deadline_at=None):
         self.calls.append((task_id, list(command), input_text, timeout))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -487,7 +487,7 @@ class CLIAdapterTests(unittest.TestCase):
 
     def test_opt_in_route_deadline_prevents_second_cli_start(self):
         class SlowRunner(CapturedRunner):
-            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None, deadline_at=None):
                 result = super().run_capture(task_id, command, input_text=input_text,
                                              cwd=cwd, env=env, timeout=timeout)
                 time.sleep(0.15)

@@ -743,7 +743,7 @@ class CapturedRunner:
         self.responses = list(responses)
         self.calls = []
 
-    def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+    def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None, deadline_at=None):
         self.calls.append(list(command))
         return self.responses.pop(0)
 
@@ -845,7 +845,7 @@ class ChatAdapterSessionTests(unittest.TestCase):
                 self.adapter = None
                 self.cancelled = []
 
-            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None, deadline_at=None):
                 self.adapter.cancel_current()
                 return 1, "", "terminated"
 
@@ -889,7 +889,7 @@ class ChatAdapterSessionTests(unittest.TestCase):
 
     def test_opt_in_deadline_refuses_resume_retry_after_budget_expires(self) -> None:
         class SlowResumeRunner(CapturedRunner):
-            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None, deadline_at=None):
                 result = super().run_capture(task_id, command, input_text=input_text,
                                              cwd=cwd, timeout=timeout)
                 if len(self.calls) == 2:
@@ -913,7 +913,7 @@ class ChatAdapterSessionTests(unittest.TestCase):
 
     def test_opt_in_deadline_also_bounds_full_context_rehydration(self) -> None:
         class SlowRecoveryRunner(CapturedRunner):
-            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None, deadline_at=None):
                 result = super().run_capture(task_id, command, input_text=input_text,
                                              cwd=cwd, timeout=timeout)
                 if len(self.calls) == 2:
@@ -937,7 +937,7 @@ class ChatAdapterSessionTests(unittest.TestCase):
 
     def test_opt_in_deadline_is_shared_across_both_agents(self) -> None:
         class SlowClaudeRunner(CapturedRunner):
-            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None, deadline_at=None):
                 result = super().run_capture(task_id, command, input_text=input_text,
                                              cwd=cwd, timeout=timeout)
                 time.sleep(0.15)
@@ -961,7 +961,7 @@ class ChatAdapterSessionTests(unittest.TestCase):
 
     def test_opt_in_deadline_is_shared_with_auto_relay(self) -> None:
         class SlowClaudeRunner(CapturedRunner):
-            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, timeout=None, deadline_at=None):
                 result = super().run_capture(task_id, command, input_text=input_text,
                                              cwd=cwd, timeout=timeout)
                 time.sleep(0.15)
