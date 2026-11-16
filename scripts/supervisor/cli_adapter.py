@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from sophia.runtime.execution_contract import ExecutionContract
+
 from .progress import WaitProgress
 from .runner import Runner
 from .schema import SchemaValidationError, normalize_structured_out_json, validate_out_json
@@ -34,7 +36,10 @@ class CLIAdapter:
         self.last_stdout = ""
         self.last_stderr = ""
 
-    def execute(self, task: Mapping[str, Any]) -> dict[str, Any]:
+    def execute(self, task: Mapping[str, Any], *,
+                execution_contract: ExecutionContract | None = None) -> dict[str, Any]:
+        if execution_contract is not None and execution_contract.surface != "agent_supervisor":
+            raise ValueError("execution contract does not match Supervisor surface")
         command_path = self.executable_path
         if command_path is None:
             command_path = shutil.which(f"{self.executable}.cmd") if os.name == "nt" else None
@@ -47,8 +52,12 @@ class CLIAdapter:
                                 enabled=self.show_progress)
         progress.start()
         timing = TurnTiming(label=f"{task.get('agent', self.executable)} {task.get('step_id', '')}".strip(),
-                            start=time.monotonic())
+                            start=time.monotonic(),
+                            turn_id=execution_contract.task_id if execution_contract else None,
+                            attempt_id=execution_contract.attempt_id if execution_contract else None)
         try:
+            timeout = (execution_contract.require_remaining_s() if execution_contract
+                       else self.timeout_seconds)
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:
                     timing.last_output = time.monotonic()
@@ -59,14 +68,17 @@ class CLIAdapter:
 
                 code, stdout, stderr = self.runner.run_capture_streaming(
                     str(task["step_id"]), self._streaming_command(task), input_text=prompt,
-                    cwd=self.cwd, timeout=self.timeout_seconds, on_line=on_line_then_stop)
+                    cwd=self.cwd, timeout=timeout, on_line=on_line_then_stop)
             else:
                 code, stdout, stderr = self.runner.run_capture(str(task["step_id"]), self._command(task), input_text=prompt,
-                                                                cwd=self.cwd, timeout=self.timeout_seconds)
+                                                                cwd=self.cwd, timeout=timeout)
                 timing.first_output = timing.last_output = time.monotonic()
             timing.exit_code = code
             timing.outcome = "completed" if code == 0 else "nonzero_exit"
         except subprocess.TimeoutExpired:
+            timing.outcome = "timeout"
+            raise
+        except TimeoutError:
             timing.outcome = "timeout"
             raise
         except BaseException:

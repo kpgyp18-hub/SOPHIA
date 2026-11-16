@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from sophia.runtime.execution_contract import ExecutionContract
+
 from .cli_adapter import CLIAdapter
 from .schema import structured_out_json_schema
 from .model_config import ModelConfig
@@ -34,9 +36,10 @@ class CodexCLIAdapter(CLIAdapter):
     def _streaming_command(self, task: Mapping[str, Any]) -> Sequence[str]:
         return [*self._command(task), "--json"]
 
-    def execute(self, task: Mapping[str, Any]) -> dict[str, Any]:
+    def execute(self, task: Mapping[str, Any], *,
+                execution_contract: ExecutionContract | None = None) -> dict[str, Any]:
         try:
-            return super().execute(task)
+            return super().execute(task, execution_contract=execution_contract)
         finally:
             path = getattr(self, "_schema_path", None)
             if path is not None:

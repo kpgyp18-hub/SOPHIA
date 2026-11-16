@@ -1,6 +1,7 @@
 import json
 import io
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -481,6 +482,32 @@ class CLIAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Supervisor(Path(directory) / "runtime", Path(directory) / "skills", {"CLAUDE": claude, "CODEX": codex}).run("task-001", CLAUDE_CODEX)
         self.assertEqual(state["status"], "DONE")
+
+    def test_opt_in_route_deadline_prevents_second_cli_start(self):
+        class SlowRunner(CapturedRunner):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+                result = super().run_capture(task_id, command, input_text=input_text,
+                                             cwd=cwd, env=env, timeout=timeout)
+                time.sleep(0.15)
+                return result
+
+        claude_runner = SlowRunner([(0, '{"status":"OK","step_id":"01-plan",'
+                                     '"handoff_request":{"target_agent":"CODEX",'
+                                     '"reason_code":"IMPLEMENTATION_REQUIRED",'
+                                     '"required_files":[],"required_skills":[],"return_to_agent":"NONE"}}', "")])
+        codex_runner = CapturedRunner([])
+        claude = ClaudeCLIAdapter(claude_runner, timeout_seconds=0.1)
+        codex = CodexCLIAdapter(codex_runner, timeout_seconds=0.1)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+                "os.environ", {"SOPHIA_G2_DEADLINE_CONTRACT": "1"}):
+            supervisor = Supervisor(Path(directory) / "runtime", Path(directory) / "skills",
+                                    {"CLAUDE": claude, "CODEX": codex})
+            state = supervisor.run("task-deadline", CLAUDE_CODEX)
+            stored = supervisor.store.load_state("task-deadline")
+        self.assertEqual((state["status"], stored["status"]), ("FAILED", "FAILED"))
+        self.assertEqual(len(claude_runner.calls), 1)
+        self.assertEqual(len(codex_runner.calls), 0)
+        self.assertEqual(codex.last_timing.outcome, "timeout")
 
     # 43. Completed work prevents a second adapter invocation.
     def test_adapter_done_task_is_not_reinvoked(self):

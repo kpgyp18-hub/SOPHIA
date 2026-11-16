@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -22,6 +24,8 @@ from .model_budget import ModelBudget
 from .model_router import ModelRouter
 from .presentation import emit_model
 from .timing import TimingLog
+from .cli_adapter import CLIAdapter
+from sophia.runtime.execution_contract import ExecutionContract
 
 _ROLE_FOR_REASON = {
     "IMPLEMENTATION_REQUIRED": "exec", "TEST_REQUIRED": "validate", "DEBUG_REQUIRED": "exec",
@@ -50,6 +54,13 @@ class Supervisor:
         if existing and existing.get("status") == "DONE":
             return existing
         initial_agent = route[0]
+        budget = None
+        if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1":
+            timeouts = [adapter.timeout_seconds for adapter in self.adapters.values()
+                        if isinstance(adapter, CLIAdapter)]
+            if timeouts:
+                budget = ExecutionContract.start("agent_supervisor", task_id,
+                                                 uuid.uuid4().hex, min(timeouts))
         guard = LoopGuard(current_agent=initial_agent)
         current_agent, current_role = initial_agent, _INITIAL_ROLE[initial_agent]
         step_number = 1
@@ -90,7 +101,11 @@ class Supervisor:
             elif current_role == "review": emit_review(current_agent)
             emit_running(current_agent, current_role, step=step_number, total=len(route))
             try:
-                output = self.adapters[current_agent].execute(task)
+                adapter = self.adapters[current_agent]
+                if budget is not None and isinstance(adapter, CLIAdapter):
+                    output = adapter.execute(task, execution_contract=budget.next_attempt(uuid.uuid4().hex))
+                else:
+                    output = adapter.execute(task)
                 validate_out_json(output, current_agent=current_agent, task_root=self.store.task_root(task_id))
                 if output.get("step_id") != step_id:
                     raise SchemaValidationError("out.json step_id does not match the active step")
