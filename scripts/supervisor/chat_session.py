@@ -268,12 +268,17 @@ class ChatSession:
         if self._evictions_since_remote_reset >= _COMPRESSION_RESET_EVICTIONS:
             self._reset_remote_sessions_for_compression()
 
-    def _reset_remote_sessions_for_compression(self) -> None:
+    def _reset_remote_sessions_for_compression(self, reason: str = "history_compaction") -> None:
         """Rehydrate resumed CLIs from the bounded local summary next turn."""
         self._last_sent_index = {name: 0 for name in self.agents}
         for agent in self.agents.values():
             reset = getattr(agent, "reset_session", None)
             if callable(reset):
+                # The next timing row identifies why this fresh remote session began.
+                try:
+                    setattr(agent, "telemetry_reset_reason", reason)
+                except (AttributeError, TypeError):
+                    pass
                 reset()
         self._evictions_since_remote_reset = 0
 
@@ -302,7 +307,7 @@ class ChatSession:
                     reset()
             self.printer("System", "local transcript and remote sessions cleared (log file is untouched)")
         elif name == "compact":
-            self._reset_remote_sessions_for_compression()
+            self._reset_remote_sessions_for_compression("manual_compact")
             self.printer("System", "remote sessions compacted; bounded local context will be restored next turn")
         elif name == "run":
             if not rest.strip():
@@ -579,6 +584,10 @@ class ChatSession:
         reset = getattr(agent, "reset_session", None)
         if not callable(reset):
             return
+        try:
+            setattr(agent, "telemetry_reset_reason", "token_threshold")
+        except (AttributeError, TypeError):
+            pass
         reset()
         self._last_sent_index[target] = 0
         self.printer(

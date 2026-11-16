@@ -38,6 +38,10 @@ class TurnTiming:
     # Runner lifecycle events (monotonic, same clock as ``start``); see Runner.last_events.
     events: dict[str, float] = field(default_factory=dict)
     started_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
+    turn_id: str | None = None
+    attempt_id: str | None = None
+    session_mode: str | None = None
+    reset_reason: str | None = None
 
     @property
     def to_first_output(self) -> float | None:
@@ -86,6 +90,10 @@ class TimingLog:
             "reconciliation": timing.reconciliation,
             "last_output_s": timing.last_output_s,
             "started_at": timing.started_at,
+            "turn_id": timing.turn_id,
+            "attempt_id": timing.attempt_id,
+            "session_mode": timing.session_mode,
+            "reset_reason": timing.reset_reason,
             "events_s": {k: round(v - timing.start, 3) for k, v in timing.events.items()},
         }
         with self.path.open("a", encoding="utf-8") as handle:

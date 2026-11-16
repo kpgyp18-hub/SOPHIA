@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -85,6 +86,9 @@ class ChatAdapter:
         self._active_lock = threading.Lock()
         self._active_task_id: str | None = None
         self._cancelled_task_ids: set[str] = set()
+        self.telemetry_reset_reason: str | None = None
+        self._turn_id: str | None = None
+        self._last_attempt_id: str | None = None
 
     def reset_session(self) -> None:
         """Forget this adapter's remote conversation identity."""
@@ -101,6 +105,7 @@ class ChatAdapter:
         # re-establishes what's actually running.
         self.resolved_model = None
         self.resolved_model_source = None
+        self.telemetry_reset_reason = "model_change"
         self.reset_session()
         return True
 
@@ -114,6 +119,8 @@ class ChatAdapter:
         return self.runner.cancel(task_id)
 
     def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
+        self._turn_id = uuid.uuid4().hex
+        self._last_attempt_id = None
         self.last_reset = False
         self.last_usage = None
         self._binary = self._resolve_binary()
@@ -131,7 +138,8 @@ class ChatAdapter:
                 for line in stdout.splitlines():
                     self._handle_event_line(line)
                 self.last_usage = extract_token_usage(stdout)
-                self.usage_log.record(self.display_name, self.last_usage)
+                self.usage_log.record(self.display_name, self.last_usage,
+                                      turn_id=self._turn_id, attempt_id=self._last_attempt_id)
                 return report.final_text
             detail = report.describe() if report is not None else "no completion evidence"
             raise ChatAdapterError(
@@ -146,6 +154,7 @@ class ChatAdapter:
             # The replacement call has only the caller's delta prompt.  Do not
             # stream that context-incomplete reply; ChatSession will detect
             # last_reset and immediately resend a complete local context.
+            self.telemetry_reset_reason = "resume_failure"
             self.reset_session()
             self.last_reset = True
             code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context, display=False)
@@ -155,7 +164,8 @@ class ChatAdapter:
         for line in stdout.splitlines():
             self._handle_event_line(line)
         self.last_usage = extract_token_usage(stdout)
-        self.usage_log.record(self.display_name, self.last_usage)
+        self.usage_log.record(self.display_name, self.last_usage,
+                              turn_id=self._turn_id, attempt_id=self._last_attempt_id)
         return extract_chat_final_text(stdout)
 
     def _run(self, task_id: str, command: Sequence[str], prompt: str, *, context: str | None = None,
@@ -165,7 +175,12 @@ class ChatAdapter:
         suffix = f" ({context})" if context else ""
         progress = WaitProgress(f"{self.display_name} 응답 대기 중{suffix}", enabled=self.show_progress)
         progress.start()
-        timing = TurnTiming(label=self.display_name, start=time.monotonic())
+        self._last_attempt_id = uuid.uuid4().hex
+        timing = TurnTiming(label=self.display_name, start=time.monotonic(),
+                            turn_id=self._turn_id, attempt_id=self._last_attempt_id,
+                            session_mode="resumed" if self._session_id else "new",
+                            reset_reason=self.telemetry_reset_reason)
+        self.telemetry_reset_reason = None
         try:
             if self.on_line is not None:
                 def on_line_then_stop(line: str) -> None:

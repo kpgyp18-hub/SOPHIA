@@ -9,6 +9,7 @@ from pathlib import Path
 
 from scripts.supervisor.chat_adapter import ClaudeChatAdapter
 from scripts.supervisor.timing import TimingLog, TurnTiming
+from scripts.supervisor.usage import UsageLog
 
 
 class TurnTimingTests(unittest.TestCase):
@@ -101,6 +102,32 @@ class TurnOutcomeFieldsTests(unittest.TestCase):
                 adapter._run("t1", ["claude"], "hi")
             self.assertEqual(adapter.last_timing.outcome, expected)
             self.assertIsNone(adapter.last_timing.exit_code)
+
+    def test_live_log_rows_join_across_new_resumed_and_compacted_attempts(self) -> None:
+        class Runner:
+            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+                return 0, ('{"type":"result","session_id":"remote-1","result":"OK",'
+                           '"usage":{"input_tokens":4,"output_tokens":2}}'), ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            latency = Path(tmp) / "latency.jsonl"
+            usage = Path(tmp) / "usage.jsonl"
+            adapter = ClaudeChatAdapter(Runner(), cwd="C:/work", executable_path="claude",
+                                        show_progress=False, timing_log=TimingLog(latency),
+                                        usage_log=UsageLog(usage))
+            adapter.send("task", "first")
+            adapter.send("task", "second")
+            adapter.telemetry_reset_reason = "token_threshold"
+            adapter.reset_session()
+            adapter.send("task", "third")
+            times = [json.loads(line) for line in latency.read_text(encoding="utf-8").splitlines()]
+            uses = [json.loads(line) for line in usage.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["session_mode"] for row in times], ["new", "resumed", "new"])
+        self.assertEqual([row["reset_reason"] for row in times], [None, None, "token_threshold"])
+        self.assertEqual(len({row["turn_id"] for row in times}), 3)
+        for timing, tokens in zip(times, uses):
+            self.assertEqual((timing["turn_id"], timing["attempt_id"]),
+                             (tokens["turn_id"], tokens["attempt_id"]))
 
 
 if __name__ == "__main__":

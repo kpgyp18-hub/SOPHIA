@@ -410,6 +410,8 @@ class ChatSessionTests(unittest.TestCase):
         session.handle_line("continue")
 
         self.assertEqual((claude.reset_calls, codex.reset_calls), (1, 1))
+        self.assertEqual((claude.telemetry_reset_reason, codex.telemetry_reset_reason),
+                         ("manual_compact", "manual_compact"))
         self.assertIn("keep this decision", claude.calls[-1])
 
     def test_heavy_remote_context_resets_and_rehydrates_on_next_turn(self) -> None:
@@ -428,6 +430,7 @@ class ChatSessionTests(unittest.TestCase):
 
         session.handle_line("first message")
         self.assertEqual(claude.reset_calls, 1)
+        self.assertEqual(claude.telemetry_reset_reason, "token_threshold")
         self.assertEqual(session._last_sent_index["Claude"], 0)
         self.assertTrue(any("remote context compacted" in text for _speaker, text in output))
 

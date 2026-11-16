@@ -85,9 +85,14 @@ class UsageLog:
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
 
-    def record(self, label: str, usage: TokenUsage | None) -> None:
+    def record(self, label: str, usage: TokenUsage | None, *,
+               turn_id: str | None = None, attempt_id: str | None = None) -> None:
         if self.path is None or usage is None:
             return
         row = {"label": label, **usage.__dict__}
+        if turn_id is not None:
+            row["turn_id"] = turn_id
+        if attempt_id is not None:
+            row["attempt_id"] = attempt_id
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
