@@ -11,6 +11,7 @@ import tomllib
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .completion import CompletionReport, reconcile_timeout
 from .progress import WaitProgress
 from .runner import Runner
 from .stream_text import extract_chat_final_text
@@ -62,6 +63,7 @@ class ChatAdapter:
         self.show_progress = show_progress
         self.timing_log = timing_log or TimingLog(None)
         self.last_timing: TurnTiming | None = None
+        self.last_completion_report: CompletionReport | None = None
         self.last_usage: TokenUsage | None = None
         self.usage_log = usage_log or UsageLog(None)
         self.model = model
@@ -116,7 +118,25 @@ class ChatAdapter:
         self.last_usage = None
         self._binary = self._resolve_binary()
         was_resuming = self._session_id is not None
-        code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context)
+        self.last_completion_report = None
+        try:
+            code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context)
+        except subprocess.TimeoutExpired as exc:
+            report: CompletionReport | None = getattr(exc, "completion_report", None)
+            if report is not None and report.recoverable:
+                # The CLI finished its turn (terminal event received) and the process is
+                # verifiably gone: only its exit hung. Keep the result, and keep the
+                # timeout visible in the timing log (outcome stays "timeout").
+                stdout = str(exc.output or "")
+                for line in stdout.splitlines():
+                    self._handle_event_line(line)
+                self.last_usage = extract_token_usage(stdout)
+                self.usage_log.record(self.display_name, self.last_usage)
+                return report.final_text
+            detail = report.describe() if report is not None else "no completion evidence"
+            raise ChatAdapterError(
+                f"{self.executable} CLI timed out after {self.timeout_seconds:g}s: {detail}; "
+                "verify the workspace before retrying") from exc
         with self._active_lock:
             was_cancelled = task_id in self._cancelled_task_ids
             self._cancelled_task_ids.discard(task_id)
@@ -172,8 +192,12 @@ class ChatAdapter:
                 cancelled = task_id in self._cancelled_task_ids
             timing.outcome = "cancelled" if cancelled else ("completed" if result[0] == 0 else "nonzero_exit")
             return result
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             timing.outcome = "timeout"
+            report = reconcile_timeout(exc.output, exc.stderr, getattr(self.runner, "last_events", None))
+            timing.reconciliation = report.state
+            self.last_completion_report = report
+            exc.completion_report = report  # type: ignore[attr-defined]
             raise
         except BaseException:
             timing.outcome = "error"

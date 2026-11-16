@@ -33,6 +33,8 @@ class TurnTiming:
     last_output: float | None = None
     outcome: str | None = None
     exit_code: int | None = None
+    # Patch 03: what a timed-out turn's partial output proved (completion.py state), else None.
+    reconciliation: str | None = None
     # Runner lifecycle events (monotonic, same clock as ``start``); see Runner.last_events.
     events: dict[str, float] = field(default_factory=dict)
     started_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
@@ -81,6 +83,7 @@ class TimingLog:
             "total_s": timing.total,
             "outcome": timing.outcome,
             "exit_code": timing.exit_code,
+            "reconciliation": timing.reconciliation,
             "last_output_s": timing.last_output_s,
             "started_at": timing.started_at,
             "events_s": {k: round(v - timing.start, 3) for k, v in timing.events.items()},

@@ -11,6 +11,15 @@ from typing import Callable, Mapping, Sequence
 
 from .writer_lock import WriterLock
 
+def _collect_partial(process: "subprocess.Popen[str]") -> tuple[str, str]:
+    """Whatever a terminated child left in its pipes, so a timeout keeps the partial output."""
+    try:
+        out, err = process.communicate(timeout=2)
+        return out or "", err or ""
+    except Exception:  # noqa: BLE001 -- best effort; the timeout itself must still surface
+        return "", ""
+
+
 # on_event(name, t_monotonic, detail): lifecycle events for patch 02 instrumentation.
 # Names: process_start, first_stdout, first_stderr, stdout_eof, stderr_eof, child_exit,
 # timeout (detail={"stage": ...}), cleanup_start, cleanup_end.  A sink must never raise
@@ -69,7 +78,8 @@ class Runner:
             emit("cleanup_start")
             self.terminate(task_id, process)
             emit("cleanup_end")
-            raise
+            partial_out, partial_err = _collect_partial(process)
+            raise subprocess.TimeoutExpired(command, timeout, output=partial_out, stderr=partial_err)
         finally:
             self.writer_lock.release_completed(task_id)
 
@@ -130,7 +140,9 @@ class Runner:
                     emit("cleanup_start")
                     self.terminate(task_id, process)
                     emit("cleanup_end")
-                    raise subprocess.TimeoutExpired(command, timeout)
+                    err_thread.join(timeout=1)
+                    raise subprocess.TimeoutExpired(command, timeout, output="".join(lines),
+                                                    stderr="".join(err_chunks))
                 if item is None:
                     break
                 if not lines:
