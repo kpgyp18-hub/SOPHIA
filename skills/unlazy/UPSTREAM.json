@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/Leonxlnx/unlazy",
+  "commit": "16671491f6679ad9378f52604d3bc2415b4120c7",
+  "source_version": "2.1.0",
+  "license": "MIT",
+  "upstream_files_modified": false,
+  "local_additions": ["UPSTREAM.json", "SOPHIA_INTEGRATION.md"]
+}
