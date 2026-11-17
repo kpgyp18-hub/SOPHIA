@@ -16,6 +16,7 @@ from typing import Callable, Protocol
 
 from .usage import TokenUsage
 from .chat_adapter import ChatAdapter, ChatAdapterInterrupted, format_resolved_model
+from sophia.runtime import attachment_policy
 from sophia.runtime.execution_contract import ExecutionContract
 
 _MENTION_TARGETS = {
@@ -238,6 +239,7 @@ class ChatSession:
         self._usage_available: set[str] = set()
         self.attachment_root = (attachment_root or Path.cwd()).resolve()
         self._pending_attachments: list[Path] = []
+        self._attachment_policy: attachment_policy.AttachmentPolicy | None = None
         self.task_tracker = task_tracker
         self._active_task_id: str | None = None
         if self.log_path is not None:
@@ -377,13 +379,18 @@ class ChatSession:
         if not supplied:
             self.printer("System", "usage: /attach <workspace-relative file path> | /attach clear")
             return
-        candidate = Path(supplied)
-        try:
-            resolved = candidate.resolve() if candidate.is_absolute() else (self.attachment_root / candidate).resolve()
-            resolved.relative_to(self.attachment_root)
-        except (OSError, ValueError):
-            self.printer("System", "attachment rejected: path must stay inside the chat workspace")
-            return
+        if attachment_policy.enabled():
+            resolved = self._grant_attachment(supplied)
+            if resolved is None:
+                return
+        else:
+            candidate = Path(supplied)
+            try:
+                resolved = candidate.resolve() if candidate.is_absolute() else (self.attachment_root / candidate).resolve()
+                resolved.relative_to(self.attachment_root)
+            except (OSError, ValueError):
+                self.printer("System", "attachment rejected: path must stay inside the chat workspace")
+                return
         if not resolved.is_file():
             self.printer("System", "attachment rejected: file not found or not a regular file")
             return
@@ -392,6 +399,35 @@ class ChatSession:
             return
         self._pending_attachments.append(resolved)
         self.printer("System", f"attachment queued: {resolved.relative_to(self.attachment_root)}")
+
+    def _grant_attachment(self, supplied: str) -> Path | None:
+        """G2 A' (opt-in): the file reference is granted by Core policy or not at all.
+
+        ``/attach --approve <path>`` is the user's explicit approval for a
+        reference the Core risk policy escalates; it applies to that one request.
+        """
+        approved = supplied == "--approve" or supplied.startswith("--approve ")
+        if approved:
+            supplied = supplied[len("--approve"):].strip()
+            if len(supplied) >= 2 and supplied[0] == supplied[-1] and supplied[0] in ("\"", "'"):
+                supplied = supplied[1:-1]
+            if not supplied:
+                self.printer("System", "usage: /attach --approve <workspace-relative file path>")
+                return None
+        if self._attachment_policy is None:
+            self._attachment_policy = attachment_policy.AttachmentPolicy(self.attachment_root)
+        try:
+            return self._attachment_policy.grant(supplied, self.agents, approved=approved)
+        except attachment_policy.OutsideWorkspace:
+            self.printer("System", "attachment rejected: path must stay inside the chat workspace")
+        except PermissionError as exc:
+            hint = ("" if approved or "approval required" not in str(exc)
+                    else " (to approve explicitly: /attach --approve <path>)")
+            self.printer("System", f"attachment rejected by Core policy: {exc}{hint}")
+        except (OSError, ValueError) as exc:
+            # An unusable path or an audit record that could not be written: no grant.
+            self.printer("System", f"attachment rejected: {exc}")
+        return None
 
     def _show_pending_attachments(self) -> None:
         if not self._pending_attachments:

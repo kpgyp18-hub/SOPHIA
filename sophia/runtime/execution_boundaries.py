@@ -20,6 +20,10 @@ class ExecutionBoundary:
     policy_owner: str
     persistent_store: str
     core_orchestrator_connected: bool
+    # G2 A' (opt-in, SOPHIA_G2_CORE_POLICY=1): work classes that ToolRegistry /
+    # PermissionEngine authorize before their host handler runs.  Everything
+    # else on the surface stays with ``policy_owner``.
+    core_policy_work_classes: tuple[str, ...] = ()
 
 
 BOUNDARIES = {
@@ -27,6 +31,7 @@ BOUNDARIES = {
         "live_chat", "scripts/chat.py", "ChatSession", "ChatTaskTracker/TaskStore",
         "ChatAdapter/Runner", "Runner", "CLI sandbox and provider permissions",
         "workspace/sophia/tasks/*.json", False,
+        core_policy_work_classes=("chat.attachment_reference",),
     ),
     "agent_supervisor": ExecutionBoundary(
         "agent_supervisor", "scripts/agents.py", "Supervisor call graph", "RuntimeStore",
