@@ -105,7 +105,8 @@ class TurnOutcomeFieldsTests(unittest.TestCase):
 
     def test_live_log_rows_join_across_new_resumed_and_compacted_attempts(self) -> None:
         class Runner:
-            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None):
+            def run_capture(self, task_id, command, *, input_text, cwd=None, env=None, timeout=None,
+                            deadline_at=None):
                 return 0, ('{"type":"result","session_id":"remote-1","result":"OK",'
                            '"usage":{"input_tokens":4,"output_tokens":2}}'), ""
 

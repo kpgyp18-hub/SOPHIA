@@ -26,6 +26,8 @@ from .presentation import emit_model
 from .timing import TimingLog
 from .cli_adapter import CLIAdapter
 from sophia.runtime.execution_contract import ExecutionContract
+from sophia.runtime.execution_recovery import (ExecutionJournal, OwnedElsewhere,
+                                               ReconciliationRequired, settle_attempt)
 
 _ROLE_FOR_REASON = {
     "IMPLEMENTATION_REQUIRED": "exec", "TEST_REQUIRED": "validate", "DEBUG_REQUIRED": "exec",
@@ -44,8 +46,11 @@ class Supervisor:
         self.codex_feature_inputs = dict(codex_feature_inputs or {})
         self.global_budget_check = global_budget_check or (lambda guard: guard.agent_handoffs < 4)
         self.initial_description = initial_description
+        # G2 C restart recovery: set only while an opted-in run owns its record.
+        self._journal: ExecutionJournal | None = None
 
     def run(self, task_id: str, route: tuple[str, ...] | list[str]) -> dict[str, Any]:
+        self._journal = None
         route = tuple(route)
         valid, _ = validate_call_graph(route)
         if not valid or not route:
@@ -59,8 +64,20 @@ class Supervisor:
             timeouts = [adapter.timeout_seconds for adapter in self.adapters.values()
                         if isinstance(adapter, CLIAdapter)]
             if timeouts:
-                budget = ExecutionContract.start("agent_supervisor", task_id,
-                                                 uuid.uuid4().hex, min(timeouts))
+                # The budget is durable: a restart continues the original deadline
+                # and never re-executes a task whose earlier attempt is unsettled.
+                from .long_task import pid_alive
+                journal = ExecutionJournal(self.store.runtime_root, owner_alive=pid_alive)
+                try:
+                    if (existing and existing.get("status") == "RUNNING"
+                            and journal.load(task_id) is None):
+                        journal.mark_interrupted("agent_supervisor", task_id,
+                                                 "state was RUNNING with no execution record")
+                    budget = journal.open("agent_supervisor", task_id,
+                                          uuid.uuid4().hex, min(timeouts))
+                except (ReconciliationRequired, TimeoutError) as exc:
+                    return self._refused(task_id, route, existing, exc)
+                self._journal = journal
         guard = LoopGuard(current_agent=initial_agent)
         current_agent, current_role = initial_agent, _INITIAL_ROLE[initial_agent]
         step_number = 1
@@ -107,7 +124,7 @@ class Supervisor:
             try:
                 adapter = self.adapters[current_agent]
                 if budget is not None and isinstance(adapter, CLIAdapter):
-                    output = adapter.execute(task, execution_contract=budget.next_attempt(uuid.uuid4().hex))
+                    output = self._journaled_execute(adapter, task, task_id, step_id, budget)
                 else:
                     output = adapter.execute(task)
                 validate_out_json(output, current_agent=current_agent, task_root=self.store.task_root(task_id))
@@ -161,6 +178,48 @@ class Supervisor:
         else: emit_failed(reason or "supervisor failure")
         state = self._state(task_id, route, status, agent, role, step_number, guard)
         self.store.write_state(task_id, state)
+        journal, self._journal = self._journal, None
+        if journal is not None:
+            # An unsettled attempt keeps the record blocked whatever the status.
+            journal.close(task_id, status, reason)
+        return state
+
+    def _journaled_execute(self, adapter: CLIAdapter, task: Mapping[str, Any], task_id: str,
+                           step_id: str, budget: ExecutionContract) -> dict[str, Any]:
+        """Run one CLI attempt with its start and its settlement on durable record."""
+        attempt = budget.next_attempt(uuid.uuid4().hex)
+        self._journal.attempt_started(task_id, attempt.attempt_id, step_id)
+        failure: BaseException | None = None
+        try:
+            return adapter.execute(task, execution_contract=attempt)
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            timing = adapter.last_timing
+            if timing is None or timing.attempt_id != attempt.attempt_id:
+                outcome, events = None, {}
+            else:
+                # The runner keeps the previous call's events until its next call.
+                outcome = timing.outcome
+                events = {name: at for name, at in timing.events.items() if at >= timing.start}
+            settled, detail = settle_attempt(outcome, events, failure)
+            self._journal.attempt_finished(task_id, attempt.attempt_id,
+                                           settled=settled, detail=detail)
+
+    def _refused(self, task_id: str, route: tuple[str, ...],
+                 existing: Mapping[str, Any] | None, cause: BaseException) -> dict[str, Any]:
+        """A restart that may not execute.  Nothing is launched and the earlier
+        run's stored fields stay as evidence; only a RUNNING status left by a
+        dead owner is corrected, because nothing is running any more."""
+        emit_need_user(str(cause))
+        if existing is None:
+            state = self._state(task_id, route, "NEED_USER", None, None, 0)
+            self.store.write_state(task_id, state)
+            return state
+        state = {**existing, "status": "NEED_USER"}
+        if existing.get("status") == "RUNNING" and not isinstance(cause, OwnedElsewhere):
+            self.store.write_state(task_id, state)
         return state
 
     @staticmethod

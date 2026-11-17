@@ -69,6 +69,9 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--real", action="store_true", help="Invoke the real Claude/Codex CLIs.")
     mode.add_argument("--dry-run", action="store_true", help="Use canned FakeAdapter responses; no live CLI calls.")
+    mode.add_argument("--reconcile", metavar="TASK_ID",
+                      help="Release a task whose interrupted execution blocks its re-run (requires --note).")
+    parser.add_argument("--note", help="With --reconcile: what was inspected before releasing the task.")
     route_group = parser.add_mutually_exclusive_group()
     route_group.add_argument("--plan-only", action="store_true", help="Route: CLAUDE only.")
     route_group.add_argument("--direct", action="store_true", help="Route: CODEX only, no planning step.")
@@ -87,6 +90,19 @@ def main() -> int:
                         help="Don't append per-step latency records to workspace/route_latency.jsonl.")
     args = parser.parse_args()
 
+    if args.reconcile:
+        if not (args.note or "").strip():
+            parser.error("--reconcile requires --note stating what was verified")
+        from scripts.supervisor.long_task import pid_alive
+        from sophia.runtime.execution_recovery import ExecutionJournal
+        try:
+            record = ExecutionJournal(args.runtime_root, owner_alive=pid_alive).reconcile(
+                args.reconcile, args.note)
+        except (ValueError, RuntimeError) as exc:
+            print(f"task_id={args.reconcile} reconcile refused: {exc}")
+            return 1
+        print(f"task_id={args.reconcile} reconciled generation={record['generation']}")
+        return 0
     if args.real and not args.description:
         parser.error("a task description is required for --real runs")
     if args.watch and not args.real:
