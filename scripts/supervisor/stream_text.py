@@ -8,6 +8,49 @@ import json
 from typing import Any, NamedTuple
 
 
+def extract_cli_diagnostic(stdout: str, stderr: str, *, limit: int = 800) -> str:
+    """Prefer explicit CLI errors to stderr banners or trailing JSON metadata.
+
+    Only error messages/codes are selected from structured output. Unrelated
+    session, usage and credential metadata must not become the diagnostic.
+    """
+    diagnostic: str | None = None
+    plain_lines: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            plain_lines.append(line)
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        parts: list[object] = []
+        if kind in ("error", "turn.failed"):
+            error = event.get("error")
+            if isinstance(error, dict):
+                parts = [error.get("code"), error.get("message")]
+            elif isinstance(error, str):
+                parts = [error]
+            else:
+                parts = [event.get("message")]
+        elif kind == "result" and (event.get("is_error") is True
+                                   or event.get("api_error")
+                                   or str(event.get("subtype", "")).startswith("error")):
+            parts = [event.get("api_error"), event.get("result")]
+            errors = event.get("errors")
+            if isinstance(errors, list):
+                parts.extend(error if isinstance(error, str) else error.get("message")
+                             for error in errors if isinstance(error, (str, dict)))
+        message = ": ".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
+        if message:
+            diagnostic = message
+    if diagnostic:
+        return diagnostic[:limit]
+    # Keep the existing plain-text stderr preference for non-JSON CLI errors.
+    return (stderr.strip() or "\n".join(plain_lines).strip() or "no error diagnostic")[-limit:]
+
+
 def extract_display_text(line: str) -> str | None:
     """Pull only human-readable message content out of one raw streaming JSONL event
     line. Returns None for plumbing/metadata events (session hooks, thread/turn

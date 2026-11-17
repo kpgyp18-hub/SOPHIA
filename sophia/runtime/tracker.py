@@ -78,6 +78,8 @@ class ChatTaskTracker:
         if state is None:
             return
         events = list(state.get("events", []))
+        if events and events[-1].get("type") in ("completed", "awaiting_handoff"):
+            return  # Restart result collection must not append completion twice.
         escalation = state.get("escalation", {})
         if escalation.get("route") != "local":
             events.append(self._event("awaiting_handoff", route=str(escalation.get("route", ""))))
@@ -85,3 +87,16 @@ class ChatTaskTracker:
             return
         events.append(self._event("completed", source=self.source))
         self.store.update(task_id, status=TaskStatus.COMPLETED, events=events)
+
+    def hold(self, task_id: str | None, reason: str) -> None:
+        """Observe an execution hold; the journal remains its admission authority."""
+        if not task_id:
+            return
+        state = self.store.read(task_id)
+        if state is None:
+            return
+        events = list(state.get("events", []))
+        if events and events[-1].get("type") == "execution_hold" and events[-1].get("reason") == reason:
+            return
+        events.append(self._event("execution_hold", reason=reason))
+        self.store.update(task_id, status=TaskStatus.USER_DECISION_REQUIRED, events=events)

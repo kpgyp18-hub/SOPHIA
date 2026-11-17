@@ -18,6 +18,7 @@ from .usage import TokenUsage
 from .chat_adapter import ChatAdapter, ChatAdapterInterrupted, format_resolved_model
 from sophia.runtime import attachment_policy
 from sophia.runtime.execution_contract import ExecutionContract
+from . import message_recovery
 
 _MENTION_TARGETS = {
     "claude": "Claude", "클로드": "Claude", "blanc": "Claude", "블랑": "Claude",
@@ -42,9 +43,9 @@ _MAX_SUMMARY_CHARS = 6000
 # discard that remote state after local compaction so the bounded local summary
 # is the only context rehydrated on the next turn.
 _COMPRESSION_RESET_EVICTIONS = 8
-# Codex resume threads can retain far more provider-side context than the
-# bounded local transcript. Reset before that hidden state grows into multi-
-# minute resumes; the next turn is rehydrated from the local compacted context.
+# Applied only to a verified current-context metric, never consumption totals.
+# The installed adapters currently provide no such metric; manual/history
+# compaction still bounds the rehydrated local conversation.
 _REMOTE_INPUT_RESET_TOKENS = 150_000
 _PERSONA_CONTEXT = {
     "Claude": ("블랑", "personas/blanc_persona.txt"),
@@ -61,6 +62,7 @@ _HELP_TEXT = (
     "/run <message> (send an explicit task to the current default agent), "
     "/steer <instruction> (while a request is running, stop and restart it with this instruction), "
     "/compact (reset remote sessions but retain bounded local context), "
+    "/request <id> [@agent] <message> and /resume <id> (opt-in durable messages), "
     "/clear (wipe local transcript and remote sessions), /exit or /quit, /help\n"
     "mention @claude/@블랑, @codex/@에이드, or @both to address a specific agent for one message. "
     "While an agent is working, new lines are accepted and queued in order. "
@@ -236,6 +238,7 @@ class ChatSession:
         self.show_timing = show_timing
         self.show_usage = show_usage
         self.usage_totals = {name: TokenUsage() for name in agents}
+        self._usage_seen = {name: TokenUsage() for name in agents}
         self._usage_available: set[str] = set()
         self.attachment_root = (attachment_root or Path.cwd()).resolve()
         self._pending_attachments: list[Path] = []
@@ -290,7 +293,19 @@ class ChatSession:
     def handle_command(self, command: str) -> bool:
         name, _, rest = command[1:].partition(" ")
         name = name.lower()
-        if name in ("exit", "quit"):
+        if name in ("request", "resume"):
+            if not message_recovery.enabled():
+                self.printer("System", "message recovery is disabled")
+            else:
+                identity, _, body = rest.strip().partition(" ")
+                if not identity or (name == "request" and not body):
+                    self.printer("System", "usage: /request <id> [@agent] <message> | /resume <id>")
+                elif name == "resume":
+                    return message_recovery.run_message(self, None, request_id=identity, resume=True)
+                else:
+                    target, text = parse_input(body, self.default_agent)
+                    return message_recovery.run_message(self, target, text, request_id=identity)
+        elif name in ("exit", "quit"):
             return False
         if name == "help":
             self.printer("System", _HELP_TEXT)
@@ -318,6 +333,8 @@ class ChatSession:
             if not rest.strip():
                 self.printer("System", "usage: /run <message>")
             else:
+                if message_recovery.enabled():
+                    return message_recovery.run_message(self, self.default_agent, rest.strip())
                 # /run is intentionally just an explicit dispatch alias: it
                 # does not create a shell execution path or bypass the normal
                 # task tracker, permissions, or agent context.
@@ -449,6 +466,9 @@ class ChatSession:
 
     def request_steer(self, instruction: str) -> bool:
         """Record an immediate work-direction update and interrupt active CLI turns."""
+        if message_recovery.enabled():
+            self.printer("System", "message recovery: queue steering as a new request after this message")
+            return False
         instruction = instruction.strip()
         if not instruction:
             self.printer("System", "usage: /steer <additional instruction>")
@@ -599,12 +619,25 @@ class ChatSession:
 
     def _print_usage(self, target: str, agent: ChatAgent) -> None:
         usage = getattr(agent, "last_usage", None)
+        # Include every normalized subprocess report, even silent resume retries
+        # and context rehydration that precede this displayed reply.
+        total = getattr(agent, "usage_total", None)
+        if isinstance(total, TokenUsage):
+            previous = self._usage_seen[target]
+            values = {name: getattr(total, name) - getattr(previous, name) for name in total.__dict__}
+            self._usage_seen[target] = total
+            if any(value < 0 for value in values.values()) or not any(values.values()):
+                return
+            usage = TokenUsage(**values)
         if not isinstance(usage, TokenUsage):
             return
         self.usage_totals[target] = self.usage_totals[target] + usage
         self._usage_available.add(target)
         if self.show_usage:
-            self.printer("System", f"{target} tokens — {usage.summary()}")
+            observation = getattr(agent, "last_usage_observation", None)
+            interval = " (since previous report, including interrupted work)" if (
+                observation is not None and observation.attribution == "since_last_report") else ""
+            self.printer("System", f"{target} tokens — {usage.summary()}{interval}")
 
     def _complete_request(self, target: str, reply: str) -> None:
         if self.stream_printer is not None:
@@ -626,8 +659,9 @@ class ChatSession:
     def _reset_heavy_remote_session(self, target: str) -> None:
         """Drop oversized provider state while retaining bounded local context."""
         agent = self.agents[target]
-        usage = getattr(agent, "last_usage", None)
-        if not isinstance(usage, TokenUsage) or usage.input_tokens < _REMOTE_INPUT_RESET_TOKENS:
+        context_tokens = getattr(agent, "last_context_input_tokens", None)
+        if (not isinstance(context_tokens, int) or isinstance(context_tokens, bool)
+                or context_tokens < _REMOTE_INPUT_RESET_TOKENS):
             return
         # History compaction may already have reset every remote session.
         if self._last_sent_index.get(target, 0) == 0:
@@ -643,7 +677,7 @@ class ChatSession:
         self._last_sent_index[target] = 0
         self.printer(
             "System",
-            f"{target}: remote context compacted after {usage.input_tokens:,} input tokens",
+            f"{target}: remote context compacted at {context_tokens:,} context input tokens",
         )
 
     def _sync_codex_network_fallback(self) -> None:
@@ -720,6 +754,8 @@ class ChatSession:
         target, message = parse_input(raw, self.default_agent)
         if target is None:
             return self.handle_command(message)
+        if message_recovery.enabled():
+            return message_recovery.run_message(self, target, message)
         message = self._take_attachments(message)
         self._record("You", message)
         self._compact_history()
@@ -833,7 +869,11 @@ class ChatSession:
                 elif raw is not ...:
                     if active is not None and raw.strip().lower().startswith("/steer"):
                         _, _, instruction = raw.strip().partition(" ")
-                        if self.request_steer(instruction):
+                        if message_recovery.enabled():
+                            if instruction.strip():
+                                pending.put(f"@{(active_target or self.default_agent).lower()} {instruction}")
+                                self.printer("System", "steering queued as a new message; current request is not replayed")
+                        elif self.request_steer(instruction):
                             active_steered = True
                     else:
                         pending.put(raw)
@@ -847,6 +887,10 @@ class ChatSession:
                         active = executor.submit(self.handle_command, message)
                         active_target = None
                     else:
+                        if message_recovery.enabled():
+                            active_target = target
+                            active = executor.submit(self.handle_line, raw)
+                            continue
                         # Record exactly once; a subsequent steering restart uses
                         # _dispatch so this original message is never duplicated.
                         message = self._take_attachments(message)

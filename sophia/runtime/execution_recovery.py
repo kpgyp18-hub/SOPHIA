@@ -55,6 +55,13 @@ class StaleOwner(RuntimeError):
     """This process no longer owns the record; its update was refused (fencing)."""
 
 
+class RequestAlreadyFinished(RuntimeError):
+    """A persisted request result must be reused rather than executed again."""
+    def __init__(self, record: Mapping[str, Any]) -> None:
+        super().__init__("request already finished")
+        self.record = dict(record)
+
+
 def settle_attempt(outcome: str | None, events: Mapping[str, Any] | None,
                    failure: BaseException | None) -> tuple[bool, str]:
     """Whether a finished attempt left a provably exited process.
@@ -110,7 +117,8 @@ class ExecutionJournal:
         return record
 
     def open(self, surface: str, task_id: str, attempt_id: str,
-             timeout_s: float) -> ExecutionContract:
+             timeout_s: float, *, request_id: str | None = None, payload_hash: str | None = None,
+             checkpoint: Mapping[str, Any] | None = None, resume: bool = False) -> ExecutionContract:
         """Start a task budget, or take over an interrupted one that never ran.
 
         A finished (or absent) record starts a new generation with a new budget:
@@ -123,36 +131,65 @@ class ExecutionJournal:
             raise ValueError("unknown execution surface")
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout must be positive and finite")
+        if request_id is not None and (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)
+                                       or not re.fullmatch(r"[a-f0-9]{64}", payload_hash or "")):
+            raise ValueError("request identity or payload hash is invalid")
+        prepared_checkpoint = _copy_checkpoint(dict(checkpoint or {})) if request_id is not None else None
         with self._locked(task_id):
             record = self.load(task_id)
             now_wall = self._wall()
+            if request_id is not None:
+                previous = self._find_request(task_id, request_id, record)
+                if previous is not None:
+                    if previous["request"]["payload_hash"] != payload_hash:
+                        raise ReconciliationRequired("request id was already used for different content")
+                    if previous["status"] == FINISHED:
+                        raise RequestAlreadyFinished(previous)
+                    if not resume:
+                        raise ReconciliationRequired("request is interrupted or active; use explicit resume")
+                elif resume:
+                    raise ReconciliationRequired("no persisted request to resume")
             if record is None or record["status"] == FINISHED:
                 generation = 1
                 if record is not None:
                     generation = record["generation"] + 1
                     path = self.path(task_id)
                     os.replace(path, path.with_name(f"execution.g{record['generation']}.json"))
-                self._write(task_id, {
+                fresh = {
                     "version": _RECORD_VERSION, "surface": surface, "task_id": task_id,
                     "generation": generation, "owner": self.owner, "owner_pid": os.getpid(),
                     "status": RUNNING, "started_wall": float(now_wall),
                     "timeout_s": float(timeout_s), "last_seen_wall": float(now_wall),
-                    "takeovers": 0, "attempts": [], "reconciliations": []})
+                    "takeovers": 0, "attempts": [], "reconciliations": []}
+                if request_id is not None:
+                    fresh["request"] = {"id": request_id, "payload_hash": payload_hash,
+                                        "checkpoint": prepared_checkpoint, "checkpoint_attempts": 0}
+                self._write(task_id, fresh)
                 # Wall clock is read first, so a restored deadline is never later
                 # than this in-process one.
                 return ExecutionContract.start(surface, task_id, attempt_id, timeout_s,
                                                now=self._monotonic())
             if record["surface"] != surface:
                 raise ReconciliationRequired("execution record belongs to another surface")
+            if request_id is not None and record.get("request", {}).get("id") != request_id:
+                raise ReconciliationRequired("another request owns the interrupted execution")
             if record["status"] != RUNNING:
                 raise ReconciliationRequired(
                     f"previous execution needs reconciliation: {record.get('reason') or 'unresolved'}")
             if record["owner"] == self.owner or self._owner_alive(record["owner_pid"]):
                 raise OwnedElsewhere(
                     f"task is held by a live process (pid {record['owner_pid']})")
-            if record["attempts"]:
+            checkpointed = (request_id is not None and resume and
+                            record.get("request", {}).get("checkpoint_attempts") == len(record["attempts"]) and
+                            all(item.get("settled") is True for item in record["attempts"]))
+            if record["attempts"] and not checkpointed:
                 return self._block(task_id, record, now_wall,
                                    f"interrupted after {len(record['attempts'])} started attempt(s)")
+            if checkpointed and record["request"]["checkpoint"].get("complete") is True:
+                record.update(status=FINISHED, terminal=record["request"]["checkpoint"].get("terminal", "DONE"),
+                              ended_wall=float(now_wall))
+                self._write(task_id, record)
+                raise RequestAlreadyFinished(record)
             if now_wall < record["last_seen_wall"] - _CLOCK_SKEW_TOLERANCE_S:
                 return self._block(task_id, record, now_wall,
                                    "wall clock moved backwards; remaining budget unknown")
@@ -217,15 +254,53 @@ class ExecutionJournal:
             unsettled = [item for item in record["attempts"] if not item.get("settled")]
             record["terminal"] = terminal
             record["ended_wall"] = float(self._wall())
-            if unsettled:
+            request_gap = ("request" in record and
+                           record["request"].get("checkpoint_attempts") != len(record["attempts"]))
+            if unsettled or request_gap:
                 record["status"] = NEEDS_RECONCILIATION
-                record["reason"] = (f"attempt {unsettled[-1].get('label')}: "
-                                    f"{unsettled[-1].get('detail')}")
+                record["reason"] = ((f"attempt {unsettled[-1].get('label')}: "
+                                     f"{unsettled[-1].get('detail')}") if unsettled
+                                    else "last attempt has no durable result checkpoint")
             else:
                 record["status"] = FINISHED
                 record["reason"] = reason
             self._touch(task_id, record)
             return record["status"]
+
+    def checkpoint(self, task_id: str, snapshot: Mapping[str, Any]) -> None:
+        """Acknowledge results and progress only after every started send settled."""
+        value = _copy_checkpoint(snapshot)
+        with self._locked(task_id):
+            record = self._owned(task_id)
+            if "request" not in record:
+                raise ValueError("execution has no request identity")
+            if any(item.get("settled") is not True for item in record["attempts"]):
+                raise ReconciliationRequired("unsettled execution cannot be checkpointed")
+            record["request"].update(checkpoint=value, checkpoint_attempts=len(record["attempts"]))
+            self._touch(task_id, record)
+
+    def request_record(self, task_id: str, request_id: str) -> dict[str, Any] | None:
+        """Read current or archived request metadata without creating a missing root."""
+        if not self.path(task_id).parent.is_dir():
+            return None
+        with self._locked(task_id):
+            return self._find_request(task_id, request_id, self.load(task_id))
+
+    def _find_request(self, task_id: str, request_id: str, current) -> dict[str, Any] | None:
+        directory = self.path(task_id).parent
+        if any(directory.glob("execution.unreadable-*.json")):
+            raise ReconciliationRequired("request history is unreadable; uniqueness cannot be verified")
+        if current is not None and current.get("request", {}).get("id") == request_id:
+            return current
+        for path in directory.glob("execution.g*.json"):
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+                _validate(previous, task_id)
+            except (OSError, ValueError) as exc:
+                raise ReconciliationRequired("archived request history is unreadable") from exc
+            if previous.get("request", {}).get("id") == request_id:
+                return previous
+        return None
 
     def reconcile(self, task_id: str, note: str) -> dict[str, Any]:
         """An operator states the previous execution was inspected and is settled."""
@@ -346,3 +421,22 @@ def _validate(record: Any, task_id: str) -> None:
         raise ValueError("unknown record status")
     if not all(isinstance(item, dict) for item in record["attempts"]):
         raise ValueError("attempts are malformed")
+    if "request" in record:
+        request = record["request"]
+        if (not isinstance(request, dict) or not isinstance(request.get("id"), str)
+                or not isinstance(request.get("payload_hash"), str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request["id"])
+                or not re.fullmatch(r"[a-f0-9]{64}", request["payload_hash"])
+                or type(request.get("checkpoint_attempts")) is not int
+                or not 0 <= request["checkpoint_attempts"] <= len(record["attempts"])):
+            raise ValueError("request metadata is malformed")
+        _copy_checkpoint(request.get("checkpoint"))
+
+
+def _copy_checkpoint(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint must be an object")
+    data = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    if len(data.encode("utf-8")) > 262144:
+        raise ValueError("checkpoint exceeds 256 KiB")
+    return json.loads(data)

@@ -14,6 +14,7 @@ from sophia.runtime.execution_contract import ExecutionContract
 from .progress import WaitProgress
 from .runner import Runner
 from .schema import SchemaValidationError, normalize_structured_out_json, validate_out_json
+from .stream_text import extract_cli_diagnostic
 from .timing import TimingLog, TurnTiming
 
 class CLIAdapterError(RuntimeError):
@@ -88,13 +89,19 @@ class CLIAdapter:
             raise
         finally:
             timing.end = time.monotonic()
-            timing.events = dict(getattr(self.runner, "last_events", None) or {})
+            timing.events = {name: at for name, at in (getattr(self.runner, "last_events", None) or {}).items()
+                             if at >= timing.start}
+            timing.event_details = {name: detail for name, detail in
+                                    (getattr(self.runner, "last_event_details", None) or {}).items()
+                                    if name in timing.events}
+            timing.output_stats = (dict(getattr(self.runner, "last_output_stats", None) or {})
+                                   if "process_start" in timing.events else {})
             progress.stop()
             self.last_timing = timing
             self.timing_log.record(timing)
         self.last_stdout, self.last_stderr = stdout, stderr
         if code != 0:
-            diagnostic = (stderr.strip() or stdout.strip())[-240:]
+            diagnostic = extract_cli_diagnostic(stdout, stderr, limit=240)
             raise CLIAdapterError(f"{self.executable} CLI exited with code {code}: {diagnostic}")
         payload = normalize_structured_out_json(self._extract_machine_output(stdout))
         try:

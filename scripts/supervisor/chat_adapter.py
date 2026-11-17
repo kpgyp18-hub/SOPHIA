@@ -17,9 +17,9 @@ from sophia.runtime.execution_contract import ExecutionContract
 from .completion import CompletionReport, reconcile_timeout
 from .progress import WaitProgress
 from .runner import Runner
-from .stream_text import extract_chat_final_text
+from .stream_text import extract_chat_final_text, extract_cli_diagnostic
 from .timing import TimingLog, TurnTiming
-from .usage import TokenUsage, UsageLog, extract_token_usage
+from .usage import TokenUsage, UsageLog, UsageTracker, extract_token_usage
 
 
 class ChatAdapterError(RuntimeError):
@@ -51,6 +51,7 @@ def format_resolved_model(agent) -> str | None:
 class ChatAdapter:
     executable = ""
     display_name = ""
+    usage_scope = "unknown"
 
     def __init__(self, runner: Runner, *, cwd: str, timeout_seconds: float = 300.0,
                  executable_path: str | None = None, on_line: Callable[[str], None] | None = None,
@@ -68,6 +69,10 @@ class ChatAdapter:
         self.last_timing: TurnTiming | None = None
         self.last_completion_report: CompletionReport | None = None
         self.last_usage: TokenUsage | None = None
+        self.usage_total = TokenUsage()
+        self.last_usage_observation = None
+        self.last_context_input_tokens: int | None = None
+        self._usage_tracker = UsageTracker()
         self.usage_log = usage_log or UsageLog(None)
         self.model = model
         # The concrete model ID the provider actually used, when the CLI
@@ -122,6 +127,14 @@ class ChatAdapter:
 
     def send(self, task_id: str, prompt: str, *, context: str | None = None,
              execution_contract: ExecutionContract | None = None) -> str:
+        if os.environ.get("SOPHIA_G2_CHAT_RECOVERY") == "1":
+            from .chat_recovery import recoverable_send
+            return recoverable_send(self, task_id, prompt, context=context,
+                                    execution_contract=execution_contract)
+        return self._send(task_id, prompt, context=context, execution_contract=execution_contract)
+
+    def _send(self, task_id: str, prompt: str, *, context: str | None = None,
+              execution_contract: ExecutionContract | None = None) -> str:
         self._turn_id = uuid.uuid4().hex
         self._last_attempt_id = None
         # G2 C rollout is opt-in. A resume-failure retry inherits this send's
@@ -136,6 +149,10 @@ class ChatAdapter:
                       if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") == "1" else None)
         self.last_reset = False
         self.last_usage = None
+        self.last_usage_observation = None
+        # Neither installed CLI exposes a verified current-context metric here.
+        # Consumption totals must never be used as a substitute.
+        self.last_context_input_tokens = None
         self._binary = self._resolve_binary()
         was_resuming = self._session_id is not None
         self.last_completion_report = None
@@ -151,9 +168,6 @@ class ChatAdapter:
                 stdout = str(exc.output or "")
                 for line in stdout.splitlines():
                     self._handle_event_line(line)
-                self.last_usage = extract_token_usage(stdout)
-                self.usage_log.record(self.display_name, self.last_usage,
-                                      turn_id=self._turn_id, attempt_id=self._last_attempt_id)
                 return report.final_text
             detail = report.describe() if report is not None else "no completion evidence"
             raise ChatAdapterError(
@@ -175,14 +189,23 @@ class ChatAdapter:
             code, stdout, stderr = self._run(task_id, self._command(), prompt, context=context,
                                              display=False, execution_contract=retry_budget)
         if code != 0:
-            diagnostic = (stderr.strip() or stdout.strip())[-800:]
+            diagnostic = extract_cli_diagnostic(stdout, stderr)
             raise ChatAdapterError(f"{self.executable} CLI exited with code {code}: {diagnostic}")
         for line in stdout.splitlines():
             self._handle_event_line(line)
-        self.last_usage = extract_token_usage(stdout)
-        self.usage_log.record(self.display_name, self.last_usage,
-                              turn_id=self._turn_id, attempt_id=self._last_attempt_id)
         return extract_chat_final_text(stdout)
+
+    def _record_usage(self, stdout: str, *, new_session: bool) -> None:
+        for line in stdout.splitlines():
+            self._handle_event_line(line)
+        observation = self._usage_tracker.observe(extract_token_usage(stdout), scope=self.usage_scope,
+                                                  session_id=self._session_id, new_session=new_session)
+        self.last_usage_observation = observation
+        self.last_usage = observation.incremental if observation is not None else None
+        if self.last_usage is not None:
+            self.usage_total = self.usage_total + self.last_usage
+        self.usage_log.record(self.display_name, self.last_usage, observation=observation,
+                              turn_id=self._turn_id, attempt_id=self._last_attempt_id)
 
     def _run(self, task_id: str, command: Sequence[str], prompt: str, *, context: str | None = None,
              display: bool = True,
@@ -228,6 +251,7 @@ class ChatAdapter:
             with self._active_lock:
                 cancelled = task_id in self._cancelled_task_ids
             timing.outcome = "cancelled" if cancelled else ("completed" if result[0] == 0 else "nonzero_exit")
+            self._record_usage(result[1], new_session=timing.session_mode == "new")
             return result
         except subprocess.TimeoutExpired as exc:
             timing.outcome = "timeout"
@@ -235,16 +259,24 @@ class ChatAdapter:
             timing.reconciliation = report.state
             self.last_completion_report = report
             exc.completion_report = report  # type: ignore[attr-defined]
+            self._record_usage(str(exc.output or ""), new_session=timing.session_mode == "new")
             raise
         except TimeoutError:
             timing.outcome = "timeout"
             raise
         except BaseException:
             timing.outcome = "error"
+            self._usage_tracker.gap = True
             raise
         finally:
             timing.end = time.monotonic()
-            timing.events = dict(getattr(self.runner, "last_events", None) or {})
+            timing.events = {name: at for name, at in (getattr(self.runner, "last_events", None) or {}).items()
+                             if at >= timing.start}
+            timing.event_details = {name: detail for name, detail in
+                                    (getattr(self.runner, "last_event_details", None) or {}).items()
+                                    if name in timing.events}
+            timing.output_stats = (dict(getattr(self.runner, "last_output_stats", None) or {})
+                                   if "process_start" in timing.events else {})
             progress.stop()
             self.last_timing = timing
             self.timing_log.record(timing)
@@ -290,6 +322,7 @@ class ChatAdapter:
 class ClaudeChatAdapter(ChatAdapter):
     executable = "claude"
     display_name = "Claude"
+    usage_scope = "turn"
 
     def __init__(self, *args, permission_mode: str = "acceptEdits",
                  allowed_tools: str = "Bash Read Write Edit Glob Grep", model: str | None = None, **kwargs) -> None:
@@ -336,6 +369,8 @@ class ClaudeChatAdapter(ChatAdapter):
 class CodexChatAdapter(ChatAdapter):
     executable = "codex"
     display_name = "Codex"
+    # Verified against this installation's turn.completed and local rollout.
+    usage_scope = "session"
 
     def __init__(self, *args, sandbox: str = "workspace-write", model: str | None = None,
                  network_access: bool = False, **kwargs) -> None:

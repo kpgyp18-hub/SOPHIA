@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -181,6 +183,142 @@ class LostWatcherTests(_Base):
         final = self.host.cancel("orph")
         self.assertEqual((final["status"], final["outcome"], final["cleanup"]), ("FINISHED", "cancelled", "child_gone"))
         self.assertTrue(_wait_gone(orphan.pid))
+
+
+class AdmissionRegressionTests(_Base):
+    class NoSpawnHost(LongTaskHost):
+        @staticmethod
+        def _spawn_watcher(task_dir):
+            state = long_task._read_state(task_dir)
+            state.update(watcher_pid=os.getpid(), child_pid=os.getpid())
+            long_task._write_state(task_dir, state)
+            return os.getpid()
+
+    def test_two_threads_cannot_both_reserve_the_last_slot(self):
+        gate = threading.Barrier(2)
+        def start(index):
+            gate.wait(timeout=5)
+            try:
+                self.NoSpawnHost(self.host.root).start(f"fake-{index}", ["NEVER_EXECUTED"], deadline_s=5)
+                return True
+            except LongTaskError:
+                return False
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            admitted = list(pool.map(start, (1, 2)))
+        self.assertEqual(sum(admitted), 1)
+
+    def test_two_processes_cannot_both_reserve_the_last_slot(self):
+        control = Path(self._tmp.name)
+        code = """
+import json,os,sys,time
+from pathlib import Path
+from scripts.supervisor.long_task import LongTaskHost,LongTaskError,_read_state,_write_state
+class Host(LongTaskHost):
+ @staticmethod
+ def _spawn_watcher(directory):
+  state=_read_state(directory);state.update(watcher_pid=os.getpid(),child_pid=os.getpid());_write_state(directory,state)
+  return os.getpid()
+control=Path(sys.argv[1]); index=sys.argv[2]
+(control/('ready-'+index)).touch()
+until=time.monotonic()+10
+while not (control/'go').exists() and time.monotonic()<until: time.sleep(.01)
+try:
+ Host(control/'lt').start('fake-'+index,['NEVER_EXECUTED'],deadline_s=5)
+ admitted=True
+except LongTaskError: admitted=False
+(control/('result-'+index)).write_text(json.dumps(admitted))
+while not (control/'release').exists() and time.monotonic()<until: time.sleep(.01)
+"""
+        processes = [subprocess.Popen([PY, "-c", code, str(control), str(i)], cwd=REPO_ROOT,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in (1, 2)]
+        try:
+            until = time.monotonic() + 7
+            while not all((control / f"ready-{i}").exists() for i in (1, 2)) and time.monotonic() < until:
+                time.sleep(.02)
+            self.assertTrue(all((control / f"ready-{i}").exists() for i in (1, 2)))
+            (control / "go").touch()
+            while not all((control / f"result-{i}").exists() for i in (1, 2)) and time.monotonic() < until:
+                time.sleep(.02)
+            self.assertTrue(all((control / f"result-{i}").exists() for i in (1, 2)))
+            self.assertEqual(sum(json.loads((control / f"result-{i}").read_text()) for i in (1, 2)), 1)
+        finally:
+            (control / "release").touch()
+            for process in processes:
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=5)
+
+    def test_admission_os_lock_is_released_when_owner_dies(self):
+        code = ("import os,sys\nfrom pathlib import Path\n"
+                "from scripts.supervisor.long_task import _admission\n"
+                "with _admission(Path(sys.argv[1])): os._exit(7)\n")
+        result = subprocess.run([PY, "-c", code, str(self.host.root)], cwd=REPO_ROOT,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.NoSpawnHost(self.host.root).start("after-death", ["NEVER_EXECUTED"], deadline_s=5)
+
+    def test_lost_unconfirmed_and_unreadable_records_block_new_work(self):
+        for kind in ("lost", "unconfirmed", "unreadable", "unknown"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                host = self.NoSpawnHost(tmp)
+                directory = Path(tmp) / "old"
+                directory.mkdir()
+                state = {"task_id": "old", "status": "LOST", "child_pid": os.getpid()}
+                if kind == "unconfirmed":
+                    state.update(status="FINISHED", cleanup="unconfirmed")
+                elif kind == "unknown":
+                    state["status"] = "UNKNOWN"
+                (directory / "state.json").write_text("{broken" if kind == "unreadable" else json.dumps(state))
+                with self.assertRaises(LongTaskError):
+                    host.start("next", ["NEVER_EXECUTED"], deadline_s=5)
+                self.assertFalse((Path(tmp) / "next").exists())
+
+    def test_reconcile_requires_note_and_refuses_live_process(self):
+        directory = self.host.root / "old"
+        directory.mkdir(parents=True)
+        long_task._write_state(directory, {"task_id": "old", "status": "LOST", "child_pid": os.getpid()})
+        with self.assertRaises(LongTaskError):
+            self.host.reconcile("old", note="")
+        with self.assertRaisesRegex(LongTaskError, "still alive"):
+            self.host.reconcile("old", note="inspect")
+        long_task._write_state(directory, {"task_id": "old", "status": "LOST", "child_pid": None})
+        final = self.host.reconcile("old", note="verified child termination and effects")
+        self.assertEqual(final["cleanup"], "operator_verified")
+        self.NoSpawnHost(self.host.root).start("next", ["NEVER_EXECUTED"], deadline_s=5)
+
+    def test_reconcile_preserves_unreadable_evidence(self):
+        directory = self.host.root / "old"
+        directory.mkdir(parents=True)
+        (directory / "state.json").write_text("{broken")
+        self.host.reconcile("old", note="manually verified no child or effects")
+        evidence = list(directory.glob("state.before-reconcile-*.json"))
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].read_text(), "{broken")
+
+    def test_watcher_spawn_failure_does_not_leave_a_false_running_reservation(self):
+        with mock.patch.object(self.host, "_spawn_watcher", side_effect=OSError("offline fixture")):
+            with self.assertRaisesRegex(LongTaskError, "watcher did not start"):
+                self.host.start("failed", ["NEVER_EXECUTED"], deadline_s=5)
+        self.assertEqual(self.host.status("failed")["cleanup"], "child_gone")
+        self.NoSpawnHost(self.host.root).start("next", ["NEVER_EXECUTED"], deadline_s=5)
+
+    def test_terminal_write_racing_with_watcher_exit_is_not_reported_lost(self):
+        running = {"task_id": "race", "status": "RUNNING", "watcher_pid": 999999, "child_pid": None}
+        finished = dict(running, status="FINISHED", outcome="completed", cleanup="child_gone")
+        with mock.patch.object(long_task, "_read_state", side_effect=[running, finished]), mock.patch.object(
+                long_task, "pid_alive", return_value=False):
+            self.assertEqual(self.host.status("race"), finished)
+
+    def test_open_state_snapshot_does_not_block_atomic_replacement(self):
+        directory = self.host.root / "snapshot"
+        directory.mkdir(parents=True)
+        long_task._write_state(directory, {"status": "RUNNING"})
+        with long_task._open_state(directory / "state.json") as reader:
+            long_task._write_state(directory, {"status": "FINISHED"})
+            self.assertEqual(json.load(reader)["status"], "RUNNING")
+        self.assertEqual(long_task._read_state(directory)["status"], "FINISHED")
 
 
 if __name__ == "__main__":

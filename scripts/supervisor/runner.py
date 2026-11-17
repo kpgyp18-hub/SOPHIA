@@ -29,12 +29,15 @@ def _collect_partial(process: "subprocess.Popen[str]") -> tuple[str, str]:
 EventSink = Callable[[str, float, Mapping[str, str]], None]
 
 
-def _emitter(sink: "EventSink | None", store: dict[str, float] | None = None) -> Callable[..., None]:
+def _emitter(sink: "EventSink | None", store: dict[str, float] | None = None,
+             details: dict[str, dict[str, str]] | None = None) -> Callable[..., None]:
     """Build emit(name, **detail). ``store`` keeps the first time each event name fired."""
     def emit(name: str, **detail: str) -> None:
         now = time.monotonic()
         if store is not None:
             store.setdefault(name, now)
+        if details is not None:
+            details.setdefault(name, dict(detail))
         if sink is None:
             return
         try:
@@ -42,6 +45,26 @@ def _emitter(sink: "EventSink | None", store: dict[str, float] | None = None) ->
         except Exception:
             pass
     return emit
+
+
+@dataclass(frozen=True)
+class OutputLimits:
+    max_bytes: int = 8 * 1024 * 1024
+    max_line_bytes: int = 2 * 1024 * 1024
+    max_chunks: int = 16384
+    queue_lines: int = 128
+
+    def __post_init__(self):
+        if any(type(value) is not int or value <= 0 for value in self.__dict__.values()):
+            raise ValueError("output limits must be positive integers")
+
+
+class OutputLimitExceeded(RuntimeError):
+    """Captured output is incomplete; this can never certify successful work."""
+    def __init__(self, channel: str, kind: str):
+        super().__init__(f"CLI output limit exceeded ({channel}/{kind}); inspect partial execution before retrying")
+        self.channel, self.kind = channel, kind
+        self.output = self.stderr = ""
 
 
 @dataclass
@@ -53,6 +76,12 @@ class Runner:
     last_events: dict[str, float] = field(default_factory=dict)
     # A failed bounded cleanup is not permission to start another child.
     cleanup_pending: set[str] = field(default_factory=set)
+    output_limits: OutputLimits | None = None
+    last_event_details: dict[str, dict[str, str]] = field(default_factory=dict)
+    last_output_stats: dict[str, int] = field(default_factory=dict)
+
+    def _limits(self):
+        return self.output_limits or (OutputLimits() if os.environ.get("SOPHIA_G2_BOUNDED_OUTPUT") == "1" else None)
 
     def start(self, task_id: str, command: Sequence[str], *, cwd: str | None = None, env: Mapping[str, str] | None = None, capture_output: bool = False) -> subprocess.Popen[str]:
         if self.cleanup_pending:
@@ -72,12 +101,17 @@ class Runner:
                     env: Mapping[str, str] | None = None, timeout: float | None = None,
                     on_event: EventSink | None = None,
                     deadline_at: float | None = None) -> tuple[int, str, str]:
+        if self._limits() is not None and deadline_at is None:
+            if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("bounded output requires a finite positive execution timeout")
+            deadline_at = time.monotonic() + timeout
         if deadline_at is not None:
             return self._run_deadline_capture(task_id, command, input_text=input_text,
                                               cwd=cwd, env=env, deadline_at=deadline_at,
                                               timeout=timeout, on_event=on_event)
         self.last_events = {}
-        emit = _emitter(on_event, self.last_events)
+        self.last_event_details, self.last_output_stats = {}, {}
+        emit = _emitter(on_event, self.last_events, self.last_event_details)
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
         emit("process_start")
         try:
@@ -106,12 +140,17 @@ class Runner:
         stderr is drained concurrently with stdout (a child that fills the stderr pipe
         would otherwise block in write() and stall stdout until the turn deadline).
         ``on_event(name, t_monotonic, detail)`` receives lifecycle events; see _emitter."""
+        if self._limits() is not None and deadline_at is None:
+            if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("bounded output requires a finite positive execution timeout")
+            deadline_at = time.monotonic() + timeout
         if deadline_at is not None:
             return self._run_deadline_capture(task_id, command, input_text=input_text,
                                               cwd=cwd, env=env, deadline_at=deadline_at,
                                               timeout=timeout, on_line=on_line, on_event=on_event)
         self.last_events = {}
-        emit = _emitter(on_event, self.last_events)
+        self.last_event_details, self.last_output_stats = {}, {}
+        emit = _emitter(on_event, self.last_events, self.last_event_details)
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
         emit("process_start")
         line_queue: queue.Queue[str | None] = queue.Queue()
@@ -187,7 +226,8 @@ class Runner:
         is reaped immediately without sending the prompt.
         """
         self.last_events = {}
-        emit = _emitter(on_event, self.last_events)
+        self.last_event_details, self.last_output_stats = {}, {}
+        emit = _emitter(on_event, self.last_events, self.last_event_details)
         if not math.isfinite(deadline_at):
             raise ValueError("execution deadline must be finite")
         if timeout is not None:
@@ -200,24 +240,80 @@ class Runner:
 
         process = self.start(task_id, command, cwd=cwd, env=env, capture_output=True)
         emit("process_start")
-        messages: queue.Queue[tuple[str, str | BaseException | None]] = queue.Queue()
+        limits = self._limits()
+        messages: queue.Queue[tuple[str, str | BaseException | None]] = queue.Queue(
+            maxsize=limits.queue_lines if limits else 0)
         out_chunks: list[str] = []
         err_chunks: list[str] = []
+        stop = threading.Event()
+        capture_lock = threading.Lock()
+        failures: list[BaseException] = []
+        stats = {"stdout_bytes": 0, "stderr_bytes": 0, "chunks": 0, "queue_peak": 0}
+
+        def deliver(kind, value):
+            if limits is None:
+                messages.put((kind, value))
+                return
+            while not stop.is_set() and time.monotonic() < deadline_at:
+                try:
+                    messages.put((kind, value), timeout=.02)
+                    stats["queue_peak"] = max(stats["queue_peak"], messages.qsize())
+                    return
+                except queue.Full:
+                    continue
+
+        def retain(channel, chunks, text):
+            if limits is None:
+                chunks.append(text)
+                return
+            size = len(text.encode("utf-8"))
+            with capture_lock:
+                if stats["stdout_bytes"] + stats["stderr_bytes"] + size > limits.max_bytes:
+                    raise OutputLimitExceeded(channel, "bytes")
+                if stats["chunks"] >= limits.max_chunks:
+                    raise OutputLimitExceeded(channel, "chunks")
+                stats[f"{channel}_bytes"] += size
+                stats["chunks"] += 1
+                chunks.append(text)
 
         def read_pipe(pipe, channel: str, chunks: list[str]) -> None:
             try:
-                for line in pipe:
-                    if not chunks:
-                        emit(f"first_{channel}")
-                    chunks.append(line)
-                    if channel == "stdout":
-                        messages.put(("line", line))
+                if limits is None:
+                    for line in pipe:
+                        if not chunks:
+                            emit(f"first_{channel}")
+                        retain(channel, chunks, line)
+                        if channel == "stdout":
+                            deliver("line", line)
+                else:
+                    parts, line_size = [], 0
+                    read = pipe.readline
+                    while not stop.is_set() and not failures:
+                        text = read(65536)
+                        if not text:
+                            break
+                        if not chunks:
+                            emit(f"first_{channel}")
+                        retain(channel, chunks, text)
+                        if channel == "stdout":
+                            line_size += len(text.encode("utf-8"))
+                            if line_size > limits.max_line_bytes:
+                                raise OutputLimitExceeded(channel, "line_bytes")
+                            parts.append(text)
+                            if text.endswith("\n"):
+                                deliver("line", "".join(parts))
+                                parts, line_size = [], 0
+                    if parts and not failures and not stop.is_set():
+                        deliver("line", "".join(parts))
             except Exception as exc:
-                messages.put(("error", exc))
+                with capture_lock:
+                    if not failures:
+                        failures.append(exc)
+                deliver("error", exc)
             finally:
                 pipe.close()
                 emit(f"{channel}_eof")
-                messages.put((channel, None))
+                deliver(channel, None)
 
         def write_input() -> None:
             try:
@@ -230,14 +326,14 @@ class Runner:
                 # A provider can exit normally without consuming all input.
                 pass
             except Exception as exc:
-                messages.put(("error", exc))
+                deliver("error", exc)
             finally:
                 if not process.stdin.closed:
                     try:
                         process.stdin.close()
                     except OSError:
                         pass
-                messages.put(("stdin", None))
+                deliver("stdin", None)
 
         threads = [threading.Thread(target=read_pipe, args=(process.stdout, "stdout", out_chunks),
                                     name=f"sophia-{task_id}-stdout", daemon=True),
@@ -253,6 +349,8 @@ class Runner:
                 thread.start()
                 started_threads.append(thread)
             while True:
+                if failures:
+                    raise failures[0]
                 remaining = deadline_at - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, timeout)
@@ -272,8 +370,11 @@ class Runner:
                 else:
                     complete.add(kind)
         except BaseException as exc:
+            stop.set()
             if isinstance(exc, subprocess.TimeoutExpired):
                 emit("timeout", stage="hard_deadline")
+            if isinstance(exc, OutputLimitExceeded):
+                emit("output_limit", channel=exc.channel, kind=exc.kind)
             emit("cleanup_start")
             try:
                 self._cleanup_deadline_process(process, started_threads)
@@ -285,8 +386,14 @@ class Runner:
             if isinstance(exc, subprocess.TimeoutExpired):
                 raise subprocess.TimeoutExpired(command, timeout, output="".join(out_chunks),
                                                 stderr="".join(err_chunks)) from exc
+            if isinstance(exc, OutputLimitExceeded):
+                exc.output, exc.stderr = "".join(out_chunks), "".join(err_chunks)
             raise
         finally:
+            stop.set()
+            if limits is not None:
+                self.last_output_stats = dict(stats, queue_capacity=limits.queue_lines,
+                                               capture_capacity_bytes=limits.max_bytes)
             self.writer_lock.release_completed(task_id)
 
     def _cleanup_deadline_process(self, process: subprocess.Popen[str],

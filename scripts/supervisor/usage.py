@@ -1,15 +1,15 @@
-"""Token-usage extraction and append-only records for chat CLI turns."""
+"""Raw consumption reports, explicit normalization and append-only chat records."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 
 @dataclass(frozen=True)
 class TokenUsage:
-    """Provider-reported token counts for one completed turn.
+    """Token consumption counts, not a measure of current context length.
 
     Counts remain optional because a CLI/provider version may omit usage from
     its event stream.  The UI never estimates tokens or cost.
@@ -44,7 +44,7 @@ class TokenUsage:
 
 
 def _count(value: object) -> int:
-    return value if isinstance(value, int) and value >= 0 else 0
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def _usage_from_mapping(value: object) -> TokenUsage | None:
@@ -77,8 +77,53 @@ def extract_token_usage(stdout: str) -> TokenUsage | None:
     return found
 
 
+@dataclass(frozen=True)
+class UsageObservation:
+    raw: TokenUsage
+    incremental: TokenUsage | None
+    scope: str
+    attribution: str
+
+
+class UsageTracker:
+    """Normalize the installed Codex CLI's observed session-total counters.
+
+    An unfamiliar resumed session or a decreasing counter establishes a new
+    baseline only. Missing reports keep the last baseline; the next delta is
+    explicitly attributed to the interval, including interrupted work.
+    """
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.baseline: TokenUsage | None = None
+        self.gap = False
+
+    def observe(self, raw: TokenUsage | None, *, scope: str, session_id: str | None,
+                new_session: bool) -> UsageObservation | None:
+        if raw is None:
+            if scope == "session" and session_id and (new_session or session_id != self.session_id):
+                self.session_id = session_id
+                self.baseline = TokenUsage() if new_session else None
+            self.gap = True
+            return None
+        if scope == "turn":
+            return UsageObservation(raw, raw, scope, "turn")
+        if scope != "session" or not session_id:
+            return UsageObservation(raw, None, "unknown", "unavailable")
+        previous = self.baseline if session_id == self.session_id and not new_session else None
+        self.session_id, self.baseline = session_id, raw
+        gap, self.gap = self.gap, False
+        if previous is None:
+            return UsageObservation(raw, raw if new_session else None, scope,
+                                    "since_session_start" if new_session else "baseline_only")
+        names = [field.name for field in fields(TokenUsage)]
+        if any(getattr(raw, name) < getattr(previous, name) for name in names):
+            return UsageObservation(raw, None, scope, "counter_reset")
+        delta = TokenUsage(**{name: getattr(raw, name) - getattr(previous, name) for name in names})
+        return UsageObservation(raw, delta, scope, "since_last_report" if gap else "turn")
+
+
 class UsageLog:
-    """Append provider-reported per-turn usage to a JSONL file."""
+    """Append normalized consumption and its raw scope to a JSONL file."""
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -86,10 +131,16 @@ class UsageLog:
             path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(self, label: str, usage: TokenUsage | None, *,
-               turn_id: str | None = None, attempt_id: str | None = None) -> None:
-        if self.path is None or usage is None:
+               turn_id: str | None = None, attempt_id: str | None = None,
+               observation: UsageObservation | None = None) -> None:
+        if self.path is None or (usage is None and observation is None):
             return
-        row = {"label": label, **usage.__dict__}
+        row = {"label": label}
+        if usage is not None:
+            row.update(usage.__dict__)
+        if observation is not None:
+            row.update(usage_schema_version=2, usage_scope=observation.scope, attribution=observation.attribution,
+                       raw_usage=observation.raw.__dict__, incremental_available=usage is not None)
         if turn_id is not None:
             row["turn_id"] = turn_id
         if attempt_id is not None:

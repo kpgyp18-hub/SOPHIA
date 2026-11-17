@@ -42,6 +42,8 @@ class TurnTiming:
     attempt_id: str | None = None
     session_mode: str | None = None
     reset_reason: str | None = None
+    event_details: dict[str, dict[str, str]] = field(default_factory=dict)
+    output_stats: dict[str, int] = field(default_factory=dict)
 
     @property
     def to_first_output(self) -> float | None:
@@ -95,6 +97,8 @@ class TimingLog:
             "session_mode": timing.session_mode,
             "reset_reason": timing.reset_reason,
             "events_s": {k: round(v - timing.start, 3) for k, v in timing.events.items()},
+            "event_details": timing.event_details,
+            "output_stats": timing.output_stats,
         }
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")

@@ -419,7 +419,7 @@ class ChatSessionTests(unittest.TestCase):
         class HeavyAgent(FakeAgent):
             def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
                 reply = super().send(task_id, prompt, context=context)
-                self.last_usage = TokenUsage(input_tokens=_REMOTE_INPUT_RESET_TOKENS)
+                self.last_context_input_tokens = _REMOTE_INPUT_RESET_TOKENS
                 return reply
 
         output: list[tuple[str, str]] = []
