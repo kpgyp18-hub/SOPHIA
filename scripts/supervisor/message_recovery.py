@@ -140,7 +140,8 @@ def run_message(session, target: str | None, message: str = "", *, request_id: s
         if not state["started"]:
             session._record("You", payload["message"])
             session._compact_history()
-            session._begin_task(payload["message"])
+            # The request body's @mention is not kept in the payload, so approval basis is unknown.
+            session._begin_task(payload["message"], target=payload["target"], explicit=None)
             state["started"] = True
             journal.checkpoint(CHAT_RECOVERY_KEY, _snapshot(session, state))
         with message_execution(journal, budget, root) as execution:

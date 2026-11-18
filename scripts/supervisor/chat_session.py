@@ -96,6 +96,12 @@ def parse_input(raw: str, default_agent: str) -> tuple[str | None, str]:
     return default_agent, stripped
 
 
+def _explicit_mention(raw: str) -> bool:
+    """Whether the line starts with a recognised @agent mention (C2(a) approval basis)."""
+    stripped = raw.strip()
+    return stripped.startswith("@") and stripped[1:].partition(" ")[0].lower() in _MENTION_TARGETS
+
+
 def _addressed_agent(text: str) -> str | None:
     """Return the explicitly addressed agent at the start of a reply, if any."""
     match = _ADDRESS_RE.search(text)
@@ -343,7 +349,7 @@ class ChatSession:
                 message = self._take_attachments(rest.strip())
                 self._record("You", message)
                 self._compact_history()
-                self._begin_task(message)
+                self._begin_task(message, target=self.default_agent, explicit=False)  # /run = default target
                 return self._dispatch(self.default_agent)
         elif name == "relay":
             enabled = rest.strip().lower()
@@ -718,10 +724,17 @@ class ChatSession:
                 "Blanc recovered: Aide fallback network disabled and remote session reset",
             )
 
-    def _begin_task(self, message: str) -> None:
+    def _begin_task(self, message: str, *, target: str | None = None, explicit: bool | None = None) -> None:
         self._execution_hold = None
         begin = getattr(self.task_tracker, "begin", None)
         self._active_task_id = begin(message) if callable(begin) else None
+        # Core connection C1: record the actual dispatch next to Core's shadow decision.
+        observe = getattr(self.task_tracker, "observe_dispatch", None)
+        if callable(observe) and target is not None:
+            try:
+                observe(self._active_task_id, target, explicit)
+            except Exception:  # noqa: BLE001 - observation only
+                pass
 
     def _complete_task(self) -> None:
         # An unsettled or blocked execution must not be reported as completed:
@@ -781,7 +794,7 @@ class ChatSession:
         message = self._take_attachments(message)
         self._record("You", message)
         self._compact_history()
-        self._begin_task(message)
+        self._begin_task(message, target=target, explicit=_explicit_mention(raw))
         return self._dispatch(target)
 
     def _dispatch(self, target: str) -> bool:
@@ -918,6 +931,6 @@ class ChatSession:
                         message = self._take_attachments(message)
                         self._record("You", message)
                         self._compact_history()
-                        self._begin_task(message)
+                        self._begin_task(message, target=target, explicit=_explicit_mention(raw))
                         active_target = target
                         active = executor.submit(self._dispatch, target)

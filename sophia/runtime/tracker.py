@@ -28,12 +28,39 @@ _HOLD_PATH = (TaskStatus.VERIFYING, TaskStatus.USER_DECISION_REQUIRED)
 
 
 class ChatTaskTracker:
-    def __init__(self, source: str, store: TaskStore | None = None) -> None:
+    def __init__(self, source: str, store: TaskStore | None = None, *, core_shadow: object | None = None) -> None:
         self.source = source
         self.store = store or TaskStore()
         self.router = Router()
         self.escalation_policy = EscalationPolicy()
         self.state_machine = TaskStateMachine()
+        # Core connection C1: observation only; never consumed by the chat path.
+        if core_shadow is None:
+            from sophia.runtime.core_shadow import CoreShadow
+            core_shadow = CoreShadow()
+        self.core_shadow = core_shadow
+
+    def _core_snapshot(self, message: str) -> dict:
+        try:
+            snapshot = self.core_shadow.snapshot(message)
+            return snapshot if isinstance(snapshot, dict) else {"error": "invalid_snapshot"}
+        except Exception as exc:  # noqa: BLE001 - observation must not break begin()
+            return {"error": type(exc).__name__[:64]}
+
+    def observe_dispatch(self, task_id: str | None, target: str | None, explicit: bool | None) -> None:
+        """Record the live dispatch next to the Core shadow decision (C1, observation only)."""
+        if not task_id:
+            return
+        try:
+            state = self.store.read(task_id)
+            if state is None:
+                return
+            from sophia.runtime.core_shadow import dispatch_view
+            shadow = dict(state.get("core_shadow") or {})
+            shadow["dispatch"] = dispatch_view(shadow, target=target, explicit=explicit)
+            self.store.update(task_id, core_shadow=shadow)
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _event(event_type: str, **details: str) -> dict[str, str]:
@@ -74,6 +101,7 @@ class ChatTaskTracker:
             brain=decision.brain,
             context_class=decision.context_class,
             escalation=decision.escalation.as_dict(),
+            core_shadow=self._core_snapshot(message),
             events=events,
         )
         return task.id
