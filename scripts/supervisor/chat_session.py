@@ -19,7 +19,7 @@ from .chat_adapter import (ChatAdapter, ChatAdapterInterrupted, ChatAdapterTimeo
                            format_resolved_model)
 from sophia.runtime import attachment_policy
 from sophia.runtime.execution_contract import ExecutionContract
-from . import message_recovery
+from . import chat_recovery, message_recovery
 
 _MENTION_TARGETS = {
     "claude": "Claude", "클로드": "Claude", "blanc": "Claude", "블랑": "Claude",
@@ -602,7 +602,7 @@ class ChatSession:
             else:
                 budget = ExecutionContract("live_chat", f"chat-{target.lower()}",
                                            uuid.uuid4().hex, *deadline)
-        reply = self._send(agent, target, prompt, context=context, execution_contract=budget)
+        reply = self._send_tracked(agent, target, prompt, context=context, execution_contract=budget)
         if not getattr(agent, "last_reset", False):
             return reply
 
@@ -611,8 +611,18 @@ class ChatSession:
         # and immediately establish the new session with all retained context.
         self._last_sent_index[target] = 0
         _, full_prompt = self._prepare_request(target)
-        return self._send(agent, target, full_prompt, context=context,
-                          execution_contract=budget)
+        return self._send_tracked(agent, target, full_prompt, context=context,
+                                  execution_contract=budget)
+
+    def _send_tracked(self, agent: ChatAgent, target: str, prompt: str, *, context: str | None = None,
+                      execution_contract: ExecutionContract | None = None) -> str:
+        """State mapping S2: link the send to the tracker task and remember an execution hold."""
+        with chat_recovery.task_ref_scope(self._active_task_id):
+            reply = self._send(agent, target, prompt, context=context, execution_contract=execution_contract)
+        hold = getattr(agent, "last_execution_hold", None)
+        if isinstance(hold, str) and hold and getattr(self, "_execution_hold", None) is None:
+            self._execution_hold = f"{target}: {hold}"
+        return reply
 
     def _print_timing(self, agent: ChatAgent) -> None:
         if not self.show_timing:
@@ -709,13 +719,21 @@ class ChatSession:
             )
 
     def _begin_task(self, message: str) -> None:
+        self._execution_hold = None
         begin = getattr(self.task_tracker, "begin", None)
         self._active_task_id = begin(message) if callable(begin) else None
 
     def _complete_task(self) -> None:
-        complete = getattr(self.task_tracker, "complete", None)
-        if callable(complete):
-            complete(self._active_task_id)
+        # An unsettled or blocked execution must not be reported as completed:
+        # the tracker records the hold and the journal stays the admission authority.
+        hold_reason, self._execution_hold = getattr(self, "_execution_hold", None), None
+        hold = getattr(self.task_tracker, "hold", None)
+        if hold_reason and callable(hold):
+            hold(self._active_task_id, hold_reason)
+        else:
+            complete = getattr(self.task_tracker, "complete", None)
+            if callable(complete):
+                complete(self._active_task_id)
         self._active_task_id = None
 
     def send_to(self, target: str, *, deadline: tuple[float, float] | None = None) -> None:

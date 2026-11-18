@@ -7,6 +7,7 @@ send, including its existing bounded resume retries, not each subprocess.
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -26,6 +27,19 @@ if TYPE_CHECKING:
 
 CHAT_RECOVERY_KEY = "live-chat"
 _MESSAGE_EXECUTION: ContextVar = ContextVar("sophia_message_execution", default=None)
+# State mapping S2: the tracker task this send belongs to, recorded on the attempt.
+_TASK_REF: ContextVar = ContextVar("sophia_chat_task_ref", default=None)
+_TASK_REF_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+@contextmanager
+def task_ref_scope(task_ref: str | None):
+    """Bind a tracker task id to sends made inside this block (observation only)."""
+    token = _TASK_REF.set(task_ref if isinstance(task_ref, str) and _TASK_REF_PATTERN.fullmatch(task_ref) else None)
+    try:
+        yield
+    finally:
+        _TASK_REF.reset(token)
 
 
 @dataclass
@@ -120,6 +134,9 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
     adapter.last_context_input_tokens = None
     adapter.last_completion_report = None
     adapter.last_reset = False
+    # Why this send left the execution unsettled or blocked (None = settled).
+    # ChatSession reads it to hold the tracker task instead of completing it.
+    adapter.last_execution_hold = None
     if os.environ.get("SOPHIA_G2_DEADLINE_CONTRACT") != "1":
         raise ChatAdapterError("chat recovery requires SOPHIA_G2_DEADLINE_CONTRACT=1")
     if execution_contract is not None and (
@@ -140,6 +157,7 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
         try:
             recovered = journal.open("live_chat", CHAT_RECOVERY_KEY, uuid.uuid4().hex, timeout)
         except ReconciliationRequired as exc:
+            adapter.last_execution_hold = f"blocked: {exc}"[:300]
             raise ChatExecutionBlocked(f"chat execution blocked: {exc}; inspect the prior execution before reconciling") from exc
     deadline = recovered.deadline_at
     started_at = recovered.started_at
@@ -148,7 +166,7 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
         started_at = min(started_at, execution_contract.started_at)
     budget = ExecutionContract("live_chat", task_id, recovered.attempt_id, started_at, deadline)
     started = time.monotonic()
-    journal.attempt_started(CHAT_RECOVERY_KEY, recovered.attempt_id, task_id)
+    journal.attempt_started(CHAT_RECOVERY_KEY, recovered.attempt_id, task_id, task_ref=_TASK_REF.get())
     failure: BaseException | None = None
     before = unknown_fingerprint("not_collected")
     reply, returned = None, False
@@ -180,5 +198,9 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
                                  settled=settled, detail=detail, axes=axes, evidence=evidence)
         if active is not None:
             active.unsettled = active.unsettled or not settled
+            if not settled:
+                adapter.last_execution_hold = f"unsettled: {detail}"[:300]
         else:
-            journal.close(CHAT_RECOVERY_KEY, "FAILED" if failure else "DONE")
+            status = journal.close(CHAT_RECOVERY_KEY, "FAILED" if failure else "DONE")
+            if status == "NEEDS_RECONCILIATION":
+                adapter.last_execution_hold = f"needs reconciliation: {detail}"[:300]

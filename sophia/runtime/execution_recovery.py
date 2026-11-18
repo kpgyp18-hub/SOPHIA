@@ -250,14 +250,20 @@ class ExecutionJournal:
                 "last_seen_wall": now_wall, "takeovers": 0, "attempts": [],
                 "reconciliations": [], "reason": reason, "ended_wall": now_wall})
 
-    def attempt_started(self, task_id: str, attempt_id: str, label: str) -> None:
+    def attempt_started(self, task_id: str, attempt_id: str, label: str, *,
+                        task_ref: str | None = None) -> None:
+        """``task_ref`` optionally links the attempt to a tracker task (state mapping S2)."""
+        if task_ref is not None and not _valid_task_ref(task_ref):
+            raise ValueError("task_ref must be 1-64 characters of [A-Za-z0-9_-]")
         with self._locked(task_id):
             record = self._owned(task_id)
             if any(item.get("attempt_id") == attempt_id for item in record["attempts"]):
                 raise ValueError("attempt_id already recorded")
-            record["attempts"].append({"attempt_id": attempt_id, "label": label,
-                                       "started_wall": float(self._wall()),
-                                       "settled": False, "detail": "started"})
+            item = {"attempt_id": attempt_id, "label": label, "started_wall": float(self._wall()),
+                    "settled": False, "detail": "started"}
+            if task_ref is not None:
+                item["task_ref"] = task_ref
+            record["attempts"].append(item)
             self._touch(task_id, record)
 
     def attempt_finished(self, task_id: str, attempt_id: str, *, settled: bool,
@@ -635,6 +641,8 @@ def _validate(record: Any, task_id: str) -> None:
     if not all(isinstance(item, dict) for item in record["attempts"]):
         raise ValueError("attempts are malformed")
     for item in record["attempts"]:
+        if "task_ref" in item and not _valid_task_ref(item["task_ref"]):
+            raise ValueError("attempt task_ref is malformed")
         if "axes" in item:
             _copy_axes(item["axes"])
         if "evidence" in item and len(_json_object(item["evidence"]).encode("utf-8")) > _EVIDENCE_LIMIT:
@@ -671,6 +679,10 @@ def _copy_checkpoint(value: Mapping[str, Any]) -> dict[str, Any]:
     if len(data.encode("utf-8")) > 262144:
         raise ValueError("checkpoint exceeds 256 KiB")
     return json.loads(data)
+
+
+def _valid_task_ref(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
 
 
 def _copy_axes(value: Mapping[str, Any]) -> dict[str, Any]:

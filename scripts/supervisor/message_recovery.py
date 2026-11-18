@@ -96,6 +96,8 @@ def run_message(session, target: str | None, message: str = "", *, request_id: s
     accepted = False
     pending_attachments = None
     terminal = "FAILED"
+    # This request owns its tracker hold; a previous request's hold must not leak in.
+    session._execution_hold = None
     try:
         if any(os.environ.get(flag) != "1" for flag in (
                 "SOPHIA_G2_CHAT_RECOVERY", "SOPHIA_G2_DEADLINE_CONTRACT")):
