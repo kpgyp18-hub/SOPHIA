@@ -305,6 +305,7 @@ class ChatSession:
                 else:
                     target, text = parse_input(body, self.default_agent)
                     return message_recovery.run_message(self, target, text, request_id=identity)
+            return True
         elif name in ("exit", "quit"):
             return False
         if name == "help":

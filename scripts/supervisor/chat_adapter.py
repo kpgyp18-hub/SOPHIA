@@ -18,7 +18,7 @@ from .completion import CompletionReport, reconcile_timeout
 from .progress import WaitProgress
 from .runner import Runner
 from .stream_text import extract_chat_final_text, extract_cli_diagnostic
-from .timing import TimingLog, TurnTiming
+from .timing import ProgressStats, TimingLog, TurnTiming
 from .usage import TokenUsage, UsageLog, UsageTracker, extract_token_usage
 
 
@@ -71,6 +71,7 @@ class ChatAdapter:
         self.last_usage: TokenUsage | None = None
         self.usage_total = TokenUsage()
         self.last_usage_observation = None
+        self.last_usage_log_error: str | None = None
         self.last_context_input_tokens: int | None = None
         self._usage_tracker = UsageTracker()
         self.usage_log = usage_log or UsageLog(None)
@@ -204,8 +205,13 @@ class ChatAdapter:
         self.last_usage = observation.incremental if observation is not None else None
         if self.last_usage is not None:
             self.usage_total = self.usage_total + self.last_usage
-        self.usage_log.record(self.display_name, self.last_usage, observation=observation,
-                              turn_id=self._turn_id, attempt_id=self._last_attempt_id)
+        self.last_usage_log_error = None
+        try:
+            self.usage_log.record(self.display_name, self.last_usage, observation=observation,
+                                  turn_id=self._turn_id, attempt_id=self._last_attempt_id)
+        except OSError as exc:
+            # Logging failure is not evidence that the completed provider failed.
+            self.last_usage_log_error = str(exc)[:800]
 
     def _run(self, task_id: str, command: Sequence[str], prompt: str, *, context: str | None = None,
              display: bool = True,
@@ -221,6 +227,9 @@ class ChatAdapter:
                             turn_id=self._turn_id, attempt_id=self._last_attempt_id,
                             session_mode="resumed" if self._session_id else "new",
                             reset_reason=self.telemetry_reset_reason)
+        stats = ProgressStats(timing.start, streaming=self.on_line is not None)
+        captured_stdout = None
+        self.last_usage_log_error = None
         self.telemetry_reset_reason = None
         try:
             timeout = (execution_contract.require_remaining_s() if execution_contract
@@ -231,6 +240,13 @@ class ChatAdapter:
                     timing.last_output = time.monotonic()
                     if timing.first_output is None:
                         timing.first_output = timing.last_output
+                    try:
+                        stats.observe(line, timing.last_output)
+                    except Exception:
+                        try:
+                            stats.observe_unknown(line, timing.last_output)
+                        except Exception:
+                            pass  # observation must not alter response or lifecycle
                     # Parse metadata (resolved model, session id) as each line
                     # arrives, ahead of the on-completion pass in send(), so a
                     # live-streamed title reflects it on this same turn.
@@ -247,6 +263,7 @@ class ChatAdapter:
                     task_id, command, input_text=prompt, cwd=self.cwd, timeout=timeout,
                     **runner_budget)
                 timing.first_output = timing.last_output = time.monotonic()
+            captured_stdout = result[1]
             timing.exit_code = result[0]
             with self._active_lock:
                 cancelled = task_id in self._cancelled_task_ids
@@ -254,6 +271,8 @@ class ChatAdapter:
             self._record_usage(result[1], new_session=timing.session_mode == "new")
             return result
         except subprocess.TimeoutExpired as exc:
+            captured_stdout = (exc.output.decode("utf-8", errors="replace") if isinstance(exc.output, bytes)
+                               else str(exc.output or ""))
             timing.outcome = "timeout"
             report = reconcile_timeout(exc.output, exc.stderr, getattr(self.runner, "last_events", None))
             timing.reconciliation = report.state
@@ -277,6 +296,11 @@ class ChatAdapter:
                                     if name in timing.events}
             timing.output_stats = (dict(getattr(self.runner, "last_output_stats", None) or {})
                                    if "process_start" in timing.events else {})
+            try:
+                timing.progress = stats.snapshot(timing.end, timing.events, timing.outcome, stdout=captured_stdout)
+            except Exception:
+                timing.progress = {"observation_errors": stats.observation_errors + 1,
+                                   "kinds": {"unknown": max(1, stats.stdout_lines)}}
             progress.stop()
             self.last_timing = timing
             self.timing_log.record(timing)

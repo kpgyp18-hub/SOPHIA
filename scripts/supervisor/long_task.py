@@ -125,11 +125,16 @@ def pid_alive(pid: int | None) -> bool:
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
-            return kernel32.GetLastError() == 5  # access denied is not proof of death
+            # Treat ERROR_INVALID_PARAMETER as the invalid/missing PID case.
+            # Access denied or any unknown error is not proof of death.
+            return ctypes.get_last_error() != 87
         try:
             code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):

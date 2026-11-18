@@ -41,6 +41,13 @@ def _snapshot(session, state: dict) -> dict:
 
 
 def _validate(state: dict, session) -> None:
+    try:
+        _validate_checkpoint(state, session)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ReconciliationRequired("message checkpoint is malformed") from exc
+
+
+def _validate_checkpoint(state: dict, session) -> None:
     if (not isinstance(state, dict) or state.get("version") != 1
             or not isinstance(state.get("payload"), dict)
             or not isinstance(state.get("history"), list)

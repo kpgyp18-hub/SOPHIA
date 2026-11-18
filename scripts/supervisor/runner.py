@@ -184,6 +184,7 @@ class Runner:
             if process.stdin is not None:
                 process.stdin.write(input_text)
                 process.stdin.close()
+                emit("stdin_closed")
             lines: list[str] = []
             deadline = None if timeout is None else time.monotonic() + timeout
             while True:

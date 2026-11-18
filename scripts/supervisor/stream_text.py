@@ -8,6 +8,40 @@ import json
 from typing import Any, NamedTuple
 
 
+def classify_progress(line: str) -> str:
+    """Classify only observed CLI shapes; unfamiliar tool protocols stay unknown.
+
+    Claude tool-use shapes have no verified local sample yet. Codex JSON emits
+    completed messages, not token deltas: no event does not imply no model work.
+    """
+    try:
+        event = json.loads(line)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not isinstance(event, dict):
+        return "unknown"
+    kind = event.get("type")
+    if kind in ("thread.started", "turn.started", "system", "init"):
+        return "meta"
+    if kind in ("turn.completed", "result"):
+        return "terminal"
+    item = event.get("item")
+    if isinstance(item, dict):
+        if item.get("type") == "command_execution":
+            if kind == "item.started":
+                return "tool_start"
+            if kind == "item.completed":
+                return "tool_end"
+        if kind == "item.completed" and item.get("type") == "agent_message":
+            return "text"
+    if kind == "stream_event":
+        inner = event.get("event")
+        delta = inner.get("delta") if isinstance(inner, dict) else None
+        if isinstance(delta, dict) and delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+            return "text"
+    return "unknown"
+
+
 def extract_cli_diagnostic(stdout: str, stderr: str, *, limit: int = 800) -> str:
     """Prefer explicit CLI errors to stderr banners or trailing JSON metadata.
 
