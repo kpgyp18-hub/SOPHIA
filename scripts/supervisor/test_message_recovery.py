@@ -186,9 +186,14 @@ class MessageRecoveryTests(unittest.TestCase):
         state = tracker.store.read(task_id)
         self.assertEqual(state["status"], "user_decision_required")
         self.assertEqual(sum(e["type"] == "execution_hold" for e in state["events"]), 1)
+        # State mapping S3: a held task is terminal under Core's state machine,
+        # so completion must not overwrite it. Idempotency is checked on a fresh task.
         tracker.complete(task_id)
-        tracker.complete(task_id)
-        state = tracker.store.read(task_id)
+        self.assertEqual(tracker.store.read(task_id)["status"], "user_decision_required")
+        completed_id = tracker.begin("hello")
+        tracker.complete(completed_id)
+        tracker.complete(completed_id)
+        state = tracker.store.read(completed_id)
         self.assertEqual(sum(e["type"] == "completed" for e in state["events"]), 1)
 
     def test_refused_duplicate_keeps_pending_attachments(self):
