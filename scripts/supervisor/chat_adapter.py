@@ -26,6 +26,14 @@ class ChatAdapterError(RuntimeError):
     pass
 
 
+class ChatAdapterTimeout(ChatAdapterError):
+    """The CLI ran past its deadline. Slowness is not evidence the provider is unavailable."""
+
+
+class ChatExecutionBlocked(ChatAdapterError):
+    """A prior execution needs reconciliation, so no CLI was started for this send."""
+
+
 class ChatAdapterInterrupted(RuntimeError):
     """A user supplied a steering instruction while this CLI turn was running."""
 
@@ -176,7 +184,7 @@ class ChatAdapter:
                     self._handle_event_line(line)
                 return report.final_text
             detail = report.describe() if report is not None else "no completion evidence"
-            raise ChatAdapterError(
+            raise ChatAdapterTimeout(
                 f"{self.executable} CLI timed out after {self.timeout_seconds:g}s: {detail}; "
                 "verify the workspace before retrying") from exc
         with self._active_lock:

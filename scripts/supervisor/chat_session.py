@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .usage import TokenUsage
-from .chat_adapter import ChatAdapter, ChatAdapterInterrupted, format_resolved_model
+from .chat_adapter import (ChatAdapter, ChatAdapterInterrupted, ChatAdapterTimeout, ChatExecutionBlocked,
+                           format_resolved_model)
 from sophia.runtime import attachment_policy
 from sophia.runtime.execution_contract import ExecutionContract
 from . import message_recovery
@@ -574,9 +575,11 @@ class ChatSession:
                 reply = agent.send(f"chat-{target.lower()}", prompt, context=context, **kwargs)
         except Exception as exc:  # noqa: BLE001 -- keep an adapter failure inside the REPL
             # This internal signal, unlike reply text, cannot be forged by a
-            # model response. User steering is intentional interruption, not
-            # evidence that the provider is unavailable.
-            if not isinstance(exc, ChatAdapterInterrupted):
+            # model response. User steering, a deadline overrun and a send
+            # blocked pending reconciliation are not evidence that the provider
+            # is unavailable, so they leave the fallback state unchanged and
+            # never widen Codex network access mid-request.
+            if not isinstance(exc, (ChatAdapterInterrupted, ChatAdapterTimeout, ChatExecutionBlocked)):
                 try:
                     setattr(agent, "last_send_failed", True)
                 except (AttributeError, TypeError):

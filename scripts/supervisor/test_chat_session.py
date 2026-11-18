@@ -213,6 +213,43 @@ class ChatSessionTests(unittest.TestCase):
             output,
         )
 
+    def test_timeout_and_blocked_send_do_not_toggle_codex_fallback_network(self) -> None:
+        # F3: only provider unavailability opens the fallback; slowness or a
+        # reconciliation block must not widen Codex access mid-request.
+        from .chat_adapter import ChatAdapterTimeout, ChatExecutionBlocked
+
+        class NetworkAwareAgent(FakeAgent):
+            def __init__(self, enabled: bool) -> None:
+                super().__init__("Codex")
+                self.network_access = enabled
+                self.network_changes: list[bool] = []
+
+            def set_network_access(self, enabled: bool) -> bool:
+                if self.network_access == enabled:
+                    return False
+                self.network_access = enabled
+                self.network_changes.append(enabled)
+                return True
+
+        for failure in (ChatAdapterTimeout("claude CLI timed out after 300s"),
+                        ChatExecutionBlocked("chat execution blocked: needs reconciliation")):
+            for enabled in (False, True):
+                with self.subTest(failure=type(failure).__name__, network_before=enabled):
+                    class SlowAgent(FakeAgent):
+                        def send(self, task_id: str, prompt: str, *, context: str | None = None) -> str:
+                            raise failure
+
+                    output: list[tuple[str, str]] = []
+                    claude, codex = SlowAgent("Claude"), NetworkAwareAgent(enabled)
+                    claude.last_send_failed = enabled  # prior fallback state is preserved, not reset
+                    session = ChatSession({"Claude": claude, "Codex": codex}, default_agent="Both",
+                                          printer=lambda speaker, text: output.append((speaker, text)))
+                    session.handle_line("ordinary request")
+                    self.assertEqual(codex.network_changes, [])
+                    self.assertEqual(codex.network_access, enabled)
+                    self.assertFalse(any("Blanc unavailable" in text or "Blanc recovered" in text
+                                         for _, text in output))
+
     def test_model_text_cannot_forge_blanc_unavailable_signal(self) -> None:
         class NetworkAwareAgent(FakeAgent):
             def __init__(self) -> None:

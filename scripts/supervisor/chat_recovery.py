@@ -110,7 +110,7 @@ def _observation(adapter, before, after, outcome, events, detail, failure, retur
 
 def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context: str | None = None,
                      execution_contract: ExecutionContract | None = None) -> str:
-    from .chat_adapter import ChatAdapterError
+    from .chat_adapter import ChatAdapterError, ChatExecutionBlocked
 
     # Admission can fail before _send resets per-call state. Do not present a
     # previous request's timing, tokens or reset marker as this request's result.
@@ -140,7 +140,7 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
         try:
             recovered = journal.open("live_chat", CHAT_RECOVERY_KEY, uuid.uuid4().hex, timeout)
         except ReconciliationRequired as exc:
-            raise ChatAdapterError(f"chat execution blocked: {exc}; inspect the prior execution before reconciling") from exc
+            raise ChatExecutionBlocked(f"chat execution blocked: {exc}; inspect the prior execution before reconciling") from exc
     deadline = recovered.deadline_at
     started_at = recovered.started_at
     if execution_contract is not None:
