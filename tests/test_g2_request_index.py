@@ -60,11 +60,15 @@ def test_invalid_index_rebuilds_from_all_archives_without_losing_identity(tmp_pa
 
 def test_long_terminal_label_keeps_the_index_usable(tmp_path):
     # N6: an unbounded terminal label must not make every lookup a full scan.
+    # close() now normalizes unknown labels, so simulate records written before that.
+    import sophia.runtime.execution_recovery as recovery
     owner = journal(tmp_path)
+    legacy = "X" * 10000
     for identity in ("first", "second"):
         owner.open("live_chat", "task", f"a-{identity}", 60, request_id=identity,
                    payload_hash=hashlib.sha256(identity.encode()).hexdigest(), checkpoint={"complete": True})
-        owner.close("task", "X" * 10000)
+        with patch.object(recovery, "OWNER_TERMINALS", recovery.OWNER_TERMINALS | {legacy}):
+            owner.close("task", legacy)
     finish(owner, "third")
     rows = [json.loads(line) for line in (tmp_path / "task/requests.index.jsonl").read_bytes().splitlines()]
     assert [len(row["terminal"]) for row in rows] == [64, 64]

@@ -31,6 +31,11 @@ RUNNING = "RUNNING"
 FINISHED = "FINISHED"
 NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
 
+# Terminal labels an owner may close with; RECONCILED and ACKNOWLEDGED_HISTORY
+# are written only by the operator paths below. See output/STATE_MAPPING_DESIGN_20261118.md.
+OWNER_TERMINALS = frozenset({"DONE", "FAILED", "NEED_USER", "EXPIRED"})
+TERMINALS = OWNER_TERMINALS | {"RECONCILED", "ACKNOWLEDGED_HISTORY"}
+
 _RECORD_VERSION = 1
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]+")
 # A restarted owner trusts the wall clock only if it has not gone backwards past
@@ -206,7 +211,8 @@ class ExecutionJournal:
                 return self._block(task_id, record, now_wall,
                                    f"interrupted after {len(record['attempts'])} started attempt(s)")
             if checkpointed and record["request"]["checkpoint"].get("complete") is True:
-                record.update(status=FINISHED, terminal=record["request"]["checkpoint"].get("terminal", "DONE"),
+                saved = record["request"]["checkpoint"].get("terminal", "DONE")
+                record.update(status=FINISHED, terminal=saved if saved in OWNER_TERMINALS else "FAILED",
                               ended_wall=float(now_wall))
                 self._write(task_id, record)
                 raise RequestAlreadyFinished(record)
@@ -279,7 +285,13 @@ class ExecutionJournal:
         with self._locked(task_id):
             record = self._owned(task_id)
             unsettled = [item for item in record["attempts"] if not item.get("settled")]
-            record["terminal"] = terminal
+            # close() runs in finally blocks, so an unknown label is normalized
+            # conservatively instead of raising and leaving the record RUNNING.
+            if terminal in OWNER_TERMINALS:
+                record["terminal"] = terminal
+            else:
+                record["terminal"] = "FAILED"
+                record["terminal_original"] = (terminal if isinstance(terminal, str) else repr(terminal))[:64]
             record["ended_wall"] = float(self._wall())
             request_gap = ("request" in record and
                            record["request"].get("checkpoint_attempts") != len(record["attempts"]))

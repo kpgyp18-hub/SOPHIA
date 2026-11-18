@@ -113,6 +113,12 @@ def main() -> int:
                               for item in record["attempts"]]
         status["last_reconciliation"] = record["reconciliations"][-1] if record["reconciliations"] else None
         status["history"] = history
+        if "terminal_original" in record:
+            status["terminal_original"] = record["terminal_original"]
+        # Read-only canonical view (state mapping S1); it never changes admission.
+        from scripts.supervisor.long_task import pid_alive
+        from sophia.runtime.state_projection import project_status
+        status["canonical"] = project_status(record, owner_alive=pid_alive)
         print(json.dumps(status, ensure_ascii=False, indent=2))
         return 0
 
