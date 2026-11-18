@@ -46,14 +46,25 @@ def message_execution(journal: ExecutionJournal, contract: ExecutionContract, cw
         _MESSAGE_EXECUTION.reset(token)
 
 
+# The pre-send probe runs inside the provider's own deadline, so it may spend at
+# most 0.5s and at most 1% of what remains (measured ~120ms). A skipped probe
+# only makes effects "unknown"; it never changes admission or the deadline.
+_PRE_SEND_PROBE_MAX_S = 0.5
+_PRE_SEND_PROBE_SHARE = 0.01
+
+
 def _fingerprint(adapter, budget, *, after=False):
+    started = time.monotonic()
     try:
-        timeout = 2.0 if after else min(2.0, budget.remaining_s())
+        timeout = 2.0 if after else min(_PRE_SEND_PROBE_MAX_S, budget.remaining_s() * _PRE_SEND_PROBE_SHARE)
         if timeout < 0.1:
-            return unknown_fingerprint("insufficient_observation_budget")
-        return workspace_fingerprint(adapter.cwd, timeout_s=timeout)
+            snapshot = unknown_fingerprint("insufficient_observation_budget")
+        else:
+            snapshot = workspace_fingerprint(adapter.cwd, timeout_s=timeout)
     except Exception:
-        return unknown_fingerprint("observation_failed")
+        snapshot = unknown_fingerprint("observation_failed")
+    snapshot["observation_s"] = round(time.monotonic() - started, 6)
+    return snapshot
 
 
 def _observation(adapter, before, after, outcome, events, detail, failure, returned, reply):
@@ -159,8 +170,12 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
         settled, detail = settle_attempt(outcome, events, failure)
         # This post-exit observation has a separate <=2s read-only budget. It
         # never extends the provider deadline or changes settled/admission.
-        after = _fingerprint(adapter, budget, after=True)
-        axes, evidence = _observation(adapter, before, after, outcome, events, detail, failure, returned, reply)
+        try:
+            after = _fingerprint(adapter, budget, after=True)
+            axes, evidence = _observation(adapter, before, after, outcome, events, detail, failure, returned, reply)
+        except Exception as exc:
+            # An observer bug must not skip attempt_finished or mask the send's own failure.
+            axes, evidence = None, {"observation_error": type(exc).__name__[:128]}
         journal.attempt_finished(CHAT_RECOVERY_KEY, recovered.attempt_id,
                                  settled=settled, detail=detail, axes=axes, evidence=evidence)
         if active is not None:

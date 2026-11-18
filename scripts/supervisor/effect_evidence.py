@@ -132,7 +132,7 @@ def workspace_fingerprint(cwd, timeout_s=2) -> dict:
 def compare_fingerprints(before: dict, after: dict) -> tuple[str, dict]:
     evidence = {"scope": SCOPE, "worktree": before.get("root"), "paths": [], "truncated": False}
     for name, value in (("before", before), ("after", after)):
-        evidence[name] = {key: value.get(key) for key in ("status", "digest", "reason")}
+        evidence[name] = {key: value.get(key) for key in ("status", "digest", "reason", "observation_s")}
     if (before.get("status") != "ok" or after.get("status") != "ok"
             or before.get("root") != after.get("root")):
         return "unknown", evidence

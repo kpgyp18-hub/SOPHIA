@@ -264,6 +264,52 @@ class RecoveryObservationTests(unittest.TestCase):
                     item = ExecutionJournal(Path(tmp) / "workspace/runtime/live_chat").load("live-chat")["attempts"][0]
                     self.assertEqual(item["axes"]["effects"], "unknown")
 
+    def test_pre_send_probe_is_capped_inside_the_provider_deadline(self):
+        from . import chat_recovery
+        for timeout_seconds, before_budget in ((300.0, 0.5), (20.0, 0.2), (5.0, None)):
+            with self.subTest(timeout=timeout_seconds), tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, FLAGS):
+                adapter = ClaudeChatAdapter(LocalRunner(), cwd=tmp, executable_path="fixture",
+                                            show_progress=False, timeout_seconds=timeout_seconds)
+                budgets = []
+
+                def probe(cwd, timeout_s):
+                    budgets.append(timeout_s)
+                    return effects.unknown_fingerprint("fixture")
+
+                with patch.object(chat_recovery, "workspace_fingerprint", side_effect=probe):
+                    self.assertEqual(adapter.send("task", "hi"), "OK")
+                # The post-exit probe keeps its separate 2s budget.
+                self.assertEqual(budgets[-1], 2.0)
+                if before_budget is None:
+                    self.assertEqual(len(budgets), 1)  # too little time left: skipped, not borrowed
+                else:
+                    self.assertEqual(len(budgets), 2)
+                    self.assertLessEqual(budgets[0], before_budget)
+                    self.assertGreater(budgets[0], before_budget * 0.9)
+                item = ExecutionJournal(Path(tmp) / "workspace/runtime/live_chat").load("live-chat")["attempts"][0]
+                self.assertEqual(item["axes"]["effects"], "unknown")
+                self.assertIsInstance(item["evidence"]["before"]["observation_s"], float)
+                if before_budget is None:
+                    self.assertEqual(item["evidence"]["before"]["reason"], "insufficient_observation_budget")
+
+    def test_observer_bug_still_finishes_attempt_and_keeps_original_failure(self):
+        from . import chat_recovery
+        for mode in ("ok", "error"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, FLAGS):
+                adapter = ClaudeChatAdapter(LocalRunner(mode), cwd=tmp, executable_path="fixture", show_progress=False)
+                with patch.object(chat_recovery, "_observation", side_effect=RuntimeError("observer bug")):
+                    if mode == "ok":
+                        self.assertEqual(adapter.send("task", "hi"), "OK")
+                    else:
+                        with self.assertRaises(ChatAdapterError):  # not the observer's RuntimeError
+                            adapter.send("task", "hi")
+                record = ExecutionJournal(Path(tmp) / "workspace/runtime/live_chat").load("live-chat")
+                item = record["attempts"][0]
+                self.assertTrue(item["settled"])  # admission still comes from settle_attempt
+                self.assertNotIn("axes", item)
+                self.assertEqual(item["evidence"], {"observation_error": "RuntimeError"})
+                self.assertEqual(record["status"], "FINISHED")
+
     def test_message_checkpoint_covers_result_evidence_and_cached_result_makes_no_probe(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, FLAGS | {"SOPHIA_G2_MESSAGE_RECOVERY": "1"}):
             agents = {name: cls(LocalRunner(), cwd=tmp, executable_path="fixture", show_progress=False)
