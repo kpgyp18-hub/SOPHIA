@@ -39,6 +39,7 @@ _CLOCK_SKEW_TOLERANCE_S = 2.0
 _LOCK_WAIT_S = 2.0
 _STALE_LOCK_S = 30.0
 _EVIDENCE_LIMIT = 16384
+_INDEX_TERMINAL_CHARS = 64
 _REQUIRED = {"version": int, "surface": str, "task_id": str, "generation": int,
              "owner": str, "owner_pid": int, "status": str, "started_wall": float,
              "timeout_s": float, "last_seen_wall": float, "attempts": list,
@@ -344,9 +345,14 @@ class ExecutionJournal:
     def _index_entry(record, path):
         request = record.get("request", {})
         stat = path.stat()
+        # The terminal label is free text (close() and checkpoints do not bound it).
+        # Keep index rows well under the 4096-byte-per-row cache guard so a long
+        # label cannot force a full archive scan on every lookup.
+        terminal = record.get("terminal")
+        terminal = terminal[:_INDEX_TERMINAL_CHARS] if isinstance(terminal, str) else None
         return {"id": request.get("id"), "payload_hash": request.get("payload_hash"),
                 "generation": record["generation"], "status": record["status"],
-                "terminal": record.get("terminal"), "file": path.name,
+                "terminal": terminal, "file": path.name,
                 "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
     def _archive_rows(self, task_id, current):
@@ -439,7 +445,7 @@ class ExecutionJournal:
 
     def _next_generation(self, task_id, record=None):
         generations = [int(match.group(1)) for path in self.path(task_id).parent.glob("execution.g*.json")
-                       if (match := re.fullmatch(r"execution.g(\d+)\.json", path.name))]
+                       if (match := re.fullmatch(r"execution\.g(\d+)\.json", path.name))]
         return max([record["generation"] if record else 0, *generations]) + 1
 
     def acknowledge_unreadable(self, task_id: str, note: str) -> dict[str, Any]:

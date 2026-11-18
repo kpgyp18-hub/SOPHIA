@@ -58,6 +58,43 @@ def test_invalid_index_rebuilds_from_all_archives_without_losing_identity(tmp_pa
     assert len([json.loads(line) for line in path.read_bytes().splitlines()]) == 2
 
 
+def test_long_terminal_label_keeps_the_index_usable(tmp_path):
+    # N6: an unbounded terminal label must not make every lookup a full scan.
+    owner = journal(tmp_path)
+    for identity in ("first", "second"):
+        owner.open("live_chat", "task", f"a-{identity}", 60, request_id=identity,
+                   payload_hash=hashlib.sha256(identity.encode()).hexdigest(), checkpoint={"complete": True})
+        owner.close("task", "X" * 10000)
+    finish(owner, "third")
+    rows = [json.loads(line) for line in (tmp_path / "task/requests.index.jsonl").read_bytes().splitlines()]
+    assert [len(row["terminal"]) for row in rows] == [64, 64]
+    assert all(len(json.dumps(row)) < 4096 for row in rows)
+    fresh = journal(tmp_path)
+    with patch.object(fresh, "_read_archive", wraps=fresh._read_archive) as reader:
+        assert fresh.request_record("task", "absent") is None
+        assert reader.call_count == 0  # served from the index, no rebuild
+        assert fresh.request_record("task", "first")["request"]["id"] == "first"
+        assert reader.call_count == 1
+
+
+def test_requestless_history_costs_one_rebuild_then_request_path_is_indexed(tmp_path):
+    # N5: request-less rotations do not maintain the index; the first request
+    # open rebuilds once, after which R8 keeps the task on the indexed path.
+    owner = journal(tmp_path)
+    for index in range(3):
+        owner.open("live_chat", "task", f"plain-{index}", 60)
+        owner.close("task", "DONE")
+    assert not (tmp_path / "task/requests.index.jsonl").exists()
+    with patch.object(owner, "_read_archive", wraps=owner._read_archive) as reader:
+        finish(owner, "first")
+        assert reader.call_count == 2  # one verified scan of the existing archives
+    with patch.object(owner, "_read_archive", wraps=owner._read_archive) as reader:
+        finish(owner, "second")
+        assert reader.call_count == 0
+    with pytest.raises(ReconciliationRequired):
+        owner.open("live_chat", "task", "plain-again", 60)
+
+
 def test_archive_count_and_metadata_changes_trigger_rebuild_or_fail_closed(tmp_path):
     owner = journal(tmp_path)
     finish(owner, "first")
