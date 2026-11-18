@@ -74,7 +74,9 @@ def main() -> int:
                       help="Release a task whose interrupted execution blocks its re-run (requires --note).")
     mode.add_argument("--execution-status", metavar="TASK_ID",
                       help="Read execution state, attempt axes and evidence without starting or releasing work.")
-    parser.add_argument("--note", help="With --reconcile: what was inspected before releasing the task.")
+    mode.add_argument("--acknowledge-unreadable", metavar="TASK_ID",
+                      help="Preserve unreadable history as acknowledged evidence (requires --note; no attempt settlement).")
+    parser.add_argument("--note", help="With --reconcile or --acknowledge-unreadable: what was inspected.")
     route_group = parser.add_mutually_exclusive_group()
     route_group.add_argument("--plan-only", action="store_true", help="Route: CLAUDE only.")
     route_group.add_argument("--direct", action="store_true", help="Route: CODEX only, no planning step.")
@@ -96,7 +98,9 @@ def main() -> int:
     if args.execution_status:
         from sophia.runtime.execution_recovery import ExecutionJournal
         try:
-            record = ExecutionJournal(args.runtime_root).load(args.execution_status)
+            journal = ExecutionJournal(args.runtime_root)
+            record = journal.load(args.execution_status)
+            history = journal.history_status(args.execution_status, record) if record is not None else None
         except (ValueError, RuntimeError, OSError) as exc:
             print(f"execution status unreadable: {exc}")
             return 1
@@ -108,7 +112,23 @@ def main() -> int:
                               ("attempt_id", "label", "settled", "detail", "axes", "evidence")}
                               for item in record["attempts"]]
         status["last_reconciliation"] = record["reconciliations"][-1] if record["reconciliations"] else None
+        status["history"] = history
         print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.acknowledge_unreadable:
+        if not (args.note or "").strip():
+            parser.error("--acknowledge-unreadable requires --note stating what was verified")
+        from scripts.supervisor.long_task import pid_alive
+        from sophia.runtime.execution_recovery import ExecutionJournal
+        try:
+            record = ExecutionJournal(args.runtime_root, owner_alive=pid_alive).acknowledge_unreadable(
+                args.acknowledge_unreadable, args.note)
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"history acknowledgement refused: {exc}")
+            return 1
+        print(f"task_id={args.acknowledge_unreadable} history acknowledged; prior request ID uniqueness is unverified; "
+              f"execution status remains {record['status']}")
         return 0
 
     if args.reconcile:

@@ -13,6 +13,7 @@ effects were audited.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -99,6 +100,7 @@ class ExecutionJournal:
         self._owner_alive = owner_alive or (lambda pid: True)
         self._wall = wall_clock
         self._monotonic = monotonic
+        self._index_state = {}
 
     def path(self, task_id: str) -> Path:
         if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
@@ -137,8 +139,11 @@ class ExecutionJournal:
             raise ValueError("request identity or payload hash is invalid")
         prepared_checkpoint = _copy_checkpoint(dict(checkpoint or {})) if request_id is not None else None
         with self._locked(task_id):
+            self._index_state.pop(task_id, None)
             record = self.load(task_id)
             now_wall = self._wall()
+            if request_id is None and record is not None and "request" in record:
+                raise ReconciliationRequired("request-bound execution requires the request recovery path")
             if request_id is not None:
                 previous = self._find_request(task_id, request_id, record)
                 if previous is not None:
@@ -151,17 +156,30 @@ class ExecutionJournal:
                 elif resume:
                     raise ReconciliationRequired("no persisted request to resume")
             if record is None or record["status"] == FINISHED:
-                generation = 1
+                if request_id is not None:
+                    rows, index_meta = self._index_state.get(task_id) or self._archive_rows(task_id, record)
+                else:
+                    rows, index_meta = [], None
+                generation = self._next_generation(task_id, record)
                 if record is not None:
-                    generation = record["generation"] + 1
                     path = self.path(task_id)
-                    os.replace(path, path.with_name(f"execution.g{record['generation']}.json"))
+                    archive = path.with_name(f"execution.g{record['generation']}.json")
+                    if archive.exists():
+                        raise ReconciliationRequired("generation archive already exists; preserve it before proceeding")
+                    os.replace(path, archive)
+                    if request_id is not None:
+                        index_meta = self._store_index(task_id, rows + [self._index_entry(record, archive)], append=index_meta)
                 fresh = {
                     "version": _RECORD_VERSION, "surface": surface, "task_id": task_id,
                     "generation": generation, "owner": self.owner, "owner_pid": os.getpid(),
                     "status": RUNNING, "started_wall": float(now_wall),
                     "timeout_s": float(timeout_s), "last_seen_wall": float(now_wall),
                     "takeovers": 0, "attempts": [], "reconciliations": []}
+                if index_meta is not None:
+                    fresh["archive_index"] = index_meta
+                if record is not None and record.get("history_acknowledgements"):
+                    fresh["history_acknowledgements"] = record["history_acknowledgements"]
+                    fresh["request_history_incomplete"] = True
                 if request_id is not None:
                     fresh["request"] = {"id": request_id, "payload_hash": payload_hash,
                                         "checkpoint": prepared_checkpoint, "checkpoint_attempts": 0}
@@ -298,20 +316,177 @@ class ExecutionJournal:
             return self._find_request(task_id, request_id, self.load(task_id))
 
     def _find_request(self, task_id: str, request_id: str, current) -> dict[str, Any] | None:
-        directory = self.path(task_id).parent
-        if any(directory.glob("execution.unreadable-*.json")):
+        if self._pending_unreadable(task_id, current):
             raise ReconciliationRequired("request history is unreadable; uniqueness cannot be verified")
         if current is not None and current.get("request", {}).get("id") == request_id:
             return current
-        for path in directory.glob("execution.g*.json"):
-            try:
-                previous = json.loads(path.read_text(encoding="utf-8"))
-                _validate(previous, task_id)
-            except (OSError, ValueError) as exc:
-                raise ReconciliationRequired("archived request history is unreadable") from exc
-            if previous.get("request", {}).get("id") == request_id:
+        rows, _meta = self._archive_rows(task_id, current)
+        for row in rows:
+            if row["id"] == request_id:
+                path = self.path(task_id).with_name(row["file"])
+                previous = self._read_archive(task_id, path)
+                if self._index_entry(previous, path) != row:
+                    raise ReconciliationRequired("request archive changed during lookup")
                 return previous
         return None
+
+    def _read_archive(self, task_id, path):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            _validate(record, task_id)
+            if path.name != f"execution.g{record['generation']}.json" or record["status"] != FINISHED:
+                raise ValueError("archive generation/status is inconsistent")
+            return record
+        except (OSError, ValueError) as exc:
+            raise ReconciliationRequired("archived request history is unreadable") from exc
+
+    @staticmethod
+    def _index_entry(record, path):
+        request = record.get("request", {})
+        stat = path.stat()
+        return {"id": request.get("id"), "payload_hash": request.get("payload_hash"),
+                "generation": record["generation"], "status": record["status"],
+                "terminal": record.get("terminal"), "file": path.name,
+                "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+    def _archive_rows(self, task_id, current):
+        """The index is a cache bound to the current journal and archive metadata.
+
+        Archives are immutable through this API. The binding detects accidental
+        cache/archive drift; it is not protection from an actor who can rewrite
+        the journal, archive contents and filesystem timestamps together.
+        """
+        directory = self.path(task_id).parent
+        archives = {path.name: path for path in directory.glob("execution.g*.json")}
+        index = directory / "requests.index.jsonl"
+        expected = (current or {}).get("archive_index")
+        try:
+            if (not isinstance(expected, dict) or type(expected.get("count")) is not int
+                    or type(expected.get("bytes")) is not int or not isinstance(expected.get("sha256"), str)
+                    or expected.get("count") != len(archives)
+                    or index.stat().st_size != expected.get("bytes")
+                    or index.stat().st_size > max(1, len(archives)) * 4096):
+                raise ValueError("index binding is unavailable")
+            data = index.read_bytes()
+            if hashlib.sha256(data).hexdigest() != expected.get("sha256") or (data and not data.endswith(b"\n")):
+                raise ValueError("index digest is stale")
+            rows = [json.loads(line) for line in data.splitlines()]
+            if len(rows) != len(archives) or {row["file"] for row in rows} != set(archives):
+                raise ValueError("index archive set differs")
+            identities = set()
+            for row in rows:
+                path = archives[row["file"]]
+                stat = path.stat()
+                if (type(row["generation"]) is not int or row["file"] != f"execution.g{row['generation']}.json"
+                        or row["status"] != FINISHED or row["size"] != stat.st_size or row["mtime_ns"] != stat.st_mtime_ns):
+                    raise ValueError("archive metadata changed")
+                if row["id"] is not None:
+                    if (not isinstance(row["id"], str) or not _TASK_ID.fullmatch(row["id"])
+                            or not isinstance(row["payload_hash"], str) or not re.fullmatch(r"[a-f0-9]{64}", row["payload_hash"])
+                            or row["id"] in identities):
+                        raise ValueError("index identity is malformed")
+                    identities.add(row["id"])
+            meta = expected
+        except (OSError, ValueError, KeyError, TypeError):
+            rows, identities = [], set()
+            for path in sorted(archives.values()):
+                record = self._read_archive(task_id, path)
+                row = self._index_entry(record, path)
+                if row["id"] is not None:
+                    if row["id"] in identities:
+                        raise ReconciliationRequired("duplicate archived request identity")
+                    identities.add(row["id"])
+                rows.append(row)
+            meta = self._store_index(task_id, rows)
+        self._index_state[task_id] = (rows, meta)
+        return rows, meta
+
+    def _store_index(self, task_id, rows, *, append=None):
+        path = self.path(task_id).with_name("requests.index.jsonl")
+        temporary = None
+        data = b"".join((json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8") for row in rows)
+        try:
+            previous = path.read_bytes() if append is not None else None
+            if (previous is not None and len(previous) == append.get("bytes")
+                    and hashlib.sha256(previous).hexdigest() == append.get("sha256")
+                    and len(rows) == append.get("count", -1) + 1 and data.startswith(previous)):
+                with path.open("ab") as output:
+                    output.write(data[len(previous):])
+                    output.flush()
+                    os.fsync(output.fileno())
+            else:
+                fd, temporary = tempfile.mkstemp(prefix="requests.index.", suffix=".tmp", dir=path.parent)
+                with os.fdopen(fd, "wb") as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, path)
+                temporary = None
+            return {"count": len(rows), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        except OSError:
+            return None  # cache failure cannot replace the verified archive scan
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    def _pending_unreadable(self, task_id, record):
+        acknowledged = {item["file"] for item in (record or {}).get("history_acknowledgements", [])}
+        return [path for path in self.path(task_id).parent.glob("execution.unreadable-*.json")
+                if not path.name.endswith(".acknowledged.json") or path.name not in acknowledged]
+
+    def _next_generation(self, task_id, record=None):
+        generations = [int(match.group(1)) for path in self.path(task_id).parent.glob("execution.g*.json")
+                       if (match := re.fullmatch(r"execution.g(\d+)\.json", path.name))]
+        return max([record["generation"] if record else 0, *generations]) + 1
+
+    def acknowledge_unreadable(self, task_id: str, note: str) -> dict[str, Any]:
+        """Explicit history acknowledgement. Does not settle or resume attempts."""
+        if not isinstance(note, str) or not note.strip() or len(note) > 4096:
+            raise ValueError("a nonempty acknowledgement note of at most 4096 characters is required")
+        directory = self.path(task_id).parent
+        if not directory.is_dir():
+            raise ValueError("no unreadable history to acknowledge")
+        with self._locked(task_id, break_stale=True):
+            record = self.load(task_id)  # unreadable current record must be reconciled first
+            pending = self._pending_unreadable(task_id, record)
+            if not pending:
+                raise ValueError("no unreadable history to acknowledge")
+            if record and record["status"] == RUNNING and self._owner_alive(record["owner_pid"]):
+                raise OwnedElsewhere("live execution owner must stop before acknowledging history")
+            now = float(self._wall())
+            if record is None:
+                record = {"version": 1, "surface": "", "task_id": task_id, "generation": self._next_generation(task_id),
+                          "owner": self.owner, "owner_pid": os.getpid(), "status": FINISHED,
+                          "started_wall": now, "last_seen_wall": now, "timeout_s": 0.0,
+                          "attempts": [], "reconciliations": [], "terminal": "ACKNOWLEDGED_HISTORY"}
+            moves = []
+            for path in pending:
+                target = path if path.name.endswith(".acknowledged.json") else path.with_name(path.stem + ".acknowledged.json")
+                if target != path and target.exists():
+                    target = path.with_name(path.stem + f"-{uuid.uuid4().hex}.acknowledged.json")
+                if target.parent.resolve() != directory.resolve():
+                    raise ValueError("acknowledgement must stay in the task directory")
+                moves.append((path, target))
+                record.setdefault("history_acknowledgements", []).append({
+                    "file": target.name, "source": path.name, "note": note.strip(), "at_wall": now, "by_pid": os.getpid()})
+            record["request_history_incomplete"] = True
+            self._write(task_id, record)  # persist user disposition before moving evidence
+            for source, target in moves:
+                if source != target:
+                    os.rename(source, target)
+            return record
+
+    def history_status(self, task_id: str, record=None) -> dict[str, Any]:
+        """Read-only counts. Status never repairs an index or creates a directory."""
+        archives = list(self.path(task_id).parent.glob("execution.g*.json"))
+        return {"archive_files": len(archives), "archive_bytes": sum(path.stat().st_size for path in archives),
+                "unacknowledged_files": len(self._pending_unreadable(task_id, record)),
+                "request_history_incomplete": bool((record or {}).get("request_history_incomplete")),
+                "limitation": "IDs used before history acknowledgement cannot be proven unique" if
+                              (record or {}).get("request_history_incomplete") else None}
 
     def reconcile(self, task_id: str, note: str) -> dict[str, Any]:
         """An operator states the previous execution was inspected and is settled."""
@@ -329,9 +504,12 @@ class ExecutionJournal:
                 record = self.load(task_id)
             except ReconciliationRequired as exc:
                 # Keep the unreadable file as evidence; the task is released.
-                os.replace(path, path.with_name(f"execution.unreadable-{int(now_wall)}.json"))
+                evidence = path.with_name(f"execution.unreadable-{int(now_wall)}.json")
+                if evidence.exists():
+                    evidence = path.with_name(f"execution.unreadable-{int(now_wall)}-{uuid.uuid4().hex}.json")
+                os.replace(path, evidence)
                 record = {"version": _RECORD_VERSION, "surface": "", "task_id": task_id,
-                          "generation": 0, "owner": self.owner, "owner_pid": os.getpid(),
+                          "generation": self._next_generation(task_id), "owner": self.owner, "owner_pid": os.getpid(),
                           "status": NEEDS_RECONCILIATION, "started_wall": now_wall,
                           "timeout_s": 0.0, "last_seen_wall": now_wall, "takeovers": 0,
                           "attempts": [], "reconciliations": [], "reason": str(exc)}
@@ -443,6 +621,19 @@ def _validate(record: Any, task_id: str) -> None:
             _copy_axes(item["axes"])
         if "evidence" in item and len(_json_object(item["evidence"]).encode("utf-8")) > _EVIDENCE_LIMIT:
             raise ValueError("attempt evidence exceeds 16 KiB")
+    if "history_acknowledgements" in record:
+        acknowledged = record["history_acknowledgements"]
+        if not isinstance(acknowledged, list) or record.get("request_history_incomplete") is not True:
+            raise ValueError("history acknowledgements are malformed")
+        for item in acknowledged:
+            if (not isinstance(item, dict) or not isinstance(item.get("file"), str)
+                    or not item["file"].startswith("execution.unreadable-")
+                    or not item["file"].endswith(".acknowledged.json")
+                    or "/" in item["file"] or "\\" in item["file"]
+                    or not isinstance(item.get("note"), str) or not item["note"].strip()
+                    or len(item["note"]) > 4096 or type(item.get("by_pid")) is not int
+                    or type(item.get("at_wall")) not in (int, float) or not math.isfinite(item["at_wall"])):
+                raise ValueError("history acknowledgement entry is malformed")
     if "request" in record:
         request = record["request"]
         if (not isinstance(request, dict) or not isinstance(request.get("id"), str)
