@@ -19,6 +19,7 @@ from sophia.runtime.execution_contract import ExecutionContract
 from sophia.runtime.execution_recovery import ExecutionJournal, ReconciliationRequired, settle_attempt
 
 from .long_task import pid_alive
+from .effect_evidence import compare_fingerprints, unknown_fingerprint, workspace_fingerprint
 
 if TYPE_CHECKING:
     from .chat_adapter import ChatAdapter
@@ -43,6 +44,57 @@ def message_execution(journal: ExecutionJournal, contract: ExecutionContract, cw
         yield value
     finally:
         _MESSAGE_EXECUTION.reset(token)
+
+
+def _fingerprint(adapter, budget, *, after=False):
+    try:
+        timeout = 2.0 if after else min(2.0, budget.remaining_s())
+        if timeout < 0.1:
+            return unknown_fingerprint("insufficient_observation_budget")
+        return workspace_fingerprint(adapter.cwd, timeout_s=timeout)
+    except Exception:
+        return unknown_fingerprint("observation_failed")
+
+
+def _observation(adapter, before, after, outcome, events, detail, failure, returned, reply):
+    # These axes describe evidence. settle_attempt remains the admission rule.
+    if detail == "not_started":
+        process = "not_started"
+    elif "cleanup_incomplete" not in events and (outcome in ("completed", "nonzero_exit")
+                                                or "child_exit" in events or "cleanup_end" in events):
+        process = "exited"
+    else:
+        process = "unverified"
+    report = adapter.last_completion_report
+    if process == "not_started":
+        result = "none"
+    elif outcome == "nonzero_exit":
+        result = "error"
+    elif report is not None and report.final_event_seen:
+        result = "final"
+    elif report is not None and report.output_lines:
+        result = "partial"
+    elif returned:
+        result = "final" if reply else "none"
+    elif getattr(failure, "output", None):
+        result = "partial"
+    else:
+        result = "error" if failure else "none"
+    try:
+        effects, evidence = compare_fingerprints(before, after)
+    except Exception:
+        effects = "unknown"
+        evidence = {"scope": unknown_fingerprint("invalid_snapshot")["scope"], "observation_error": True}
+    try:
+        observed_capability = adapter.effect_capability
+    except Exception:
+        observed_capability = "unknown"
+    if observed_capability not in ("read_only", "workspace_write", "workspace_write_network", "unknown"):
+        observed_capability = "unknown"
+    evidence.update(capability=observed_capability,
+                    capability_scope="Adapter flags only; global CLI policy, hooks and extra tools are not inspected. "
+                                     "Not a grant or isolation proof.")
+    return {"process": process, "result": result, "persisted": False, "effects": effects}, evidence
 
 
 def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context: str | None = None,
@@ -87,8 +139,13 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
     started = time.monotonic()
     journal.attempt_started(CHAT_RECOVERY_KEY, recovered.attempt_id, task_id)
     failure: BaseException | None = None
+    before = unknown_fingerprint("not_collected")
+    reply, returned = None, False
     try:
-        return adapter._send(task_id, prompt, context=context, execution_contract=budget)
+        before = _fingerprint(adapter, budget)
+        reply = adapter._send(task_id, prompt, context=context, execution_contract=budget)
+        returned = True
+        return reply
     except BaseException as exc:
         failure = exc
         raise
@@ -100,8 +157,12 @@ def recoverable_send(adapter: ChatAdapter, task_id: str, prompt: str, *, context
             outcome = timing.outcome
             events = {name: at for name, at in timing.events.items() if at >= timing.start}
         settled, detail = settle_attempt(outcome, events, failure)
+        # This post-exit observation has a separate <=2s read-only budget. It
+        # never extends the provider deadline or changes settled/admission.
+        after = _fingerprint(adapter, budget, after=True)
+        axes, evidence = _observation(adapter, before, after, outcome, events, detail, failure, returned, reply)
         journal.attempt_finished(CHAT_RECOVERY_KEY, recovered.attempt_id,
-                                 settled=settled, detail=detail)
+                                 settled=settled, detail=detail, axes=axes, evidence=evidence)
         if active is not None:
             active.unsettled = active.unsettled or not settled
         else:

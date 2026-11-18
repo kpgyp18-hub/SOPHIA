@@ -12,6 +12,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +72,8 @@ def main() -> int:
     mode.add_argument("--dry-run", action="store_true", help="Use canned FakeAdapter responses; no live CLI calls.")
     mode.add_argument("--reconcile", metavar="TASK_ID",
                       help="Release a task whose interrupted execution blocks its re-run (requires --note).")
+    mode.add_argument("--execution-status", metavar="TASK_ID",
+                      help="Read execution state, attempt axes and evidence without starting or releasing work.")
     parser.add_argument("--note", help="With --reconcile: what was inspected before releasing the task.")
     route_group = parser.add_mutually_exclusive_group()
     route_group.add_argument("--plan-only", action="store_true", help="Route: CLAUDE only.")
@@ -89,6 +92,24 @@ def main() -> int:
     parser.add_argument("--no-timing-log", action="store_true",
                         help="Don't append per-step latency records to workspace/route_latency.jsonl.")
     args = parser.parse_args()
+
+    if args.execution_status:
+        from sophia.runtime.execution_recovery import ExecutionJournal
+        try:
+            record = ExecutionJournal(args.runtime_root).load(args.execution_status)
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"execution status unreadable: {exc}")
+            return 1
+        if record is None:
+            print(f"task_id={args.execution_status} execution record not found")
+            return 1
+        status = {key: record.get(key) for key in ("version", "task_id", "generation", "status", "terminal", "reason")}
+        status["attempts"] = [{key: item.get(key) for key in
+                              ("attempt_id", "label", "settled", "detail", "axes", "evidence")}
+                              for item in record["attempts"]]
+        status["last_reconciliation"] = record["reconciliations"][-1] if record["reconciliations"] else None
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
 
     if args.reconcile:
         if not (args.note or "").strip():

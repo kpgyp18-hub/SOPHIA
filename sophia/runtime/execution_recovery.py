@@ -37,6 +37,7 @@ _TASK_ID = re.compile(r"[A-Za-z0-9_-]+")
 _CLOCK_SKEW_TOLERANCE_S = 2.0
 _LOCK_WAIT_S = 2.0
 _STALE_LOCK_S = 30.0
+_EVIDENCE_LIMIT = 16384
 _REQUIRED = {"version": int, "surface": str, "task_id": str, "generation": int,
              "owner": str, "owner_pid": int, "status": str, "started_wall": float,
              "timeout_s": float, "last_seen_wall": float, "attempts": list,
@@ -235,13 +236,20 @@ class ExecutionJournal:
             self._touch(task_id, record)
 
     def attempt_finished(self, task_id: str, attempt_id: str, *, settled: bool,
-                         detail: str) -> None:
+                         detail: str, axes: Mapping[str, Any] | None = None,
+                         evidence: Mapping[str, Any] | None = None) -> None:
+        observed_axes = _copy_axes(axes) if axes is not None else None
+        observed_evidence = _bounded_evidence(evidence) if evidence is not None else None
         with self._locked(task_id):
             record = self._owned(task_id)
             for item in record["attempts"]:
                 if item.get("attempt_id") == attempt_id:
                     item.update(settled=bool(settled), detail=detail,
                                 ended_wall=float(self._wall()))
+                    if observed_axes is not None:
+                        item["axes"] = observed_axes
+                    if observed_evidence is not None:
+                        item["evidence"] = observed_evidence
                     break
             else:
                 raise ValueError("attempt was never recorded as started")
@@ -277,6 +285,9 @@ class ExecutionJournal:
             if any(item.get("settled") is not True for item in record["attempts"]):
                 raise ReconciliationRequired("unsettled execution cannot be checkpointed")
             record["request"].update(checkpoint=value, checkpoint_attempts=len(record["attempts"]))
+            for item in record["attempts"]:
+                if "axes" in item:
+                    item["axes"]["persisted"] = True
             self._touch(task_id, record)
 
     def request_record(self, task_id: str, request_id: str) -> dict[str, Any] | None:
@@ -331,6 +342,12 @@ class ExecutionJournal:
                 raise ReconciliationRequired(
                     f"owner process {record['owner_pid']} is still alive; stop it first")
             entry.update(from_status=record["status"], from_reason=record.get("reason"))
+            unresolved = [item for item in record["attempts"]
+                          if not item.get("settled") or not item.get("axes", {}).get("persisted")]
+            entry["evidence_seen"] = _bounded_evidence({
+                "attempts": [{key: item.get(key) for key in ("attempt_id", "axes", "evidence")}
+                             for item in unresolved[:50]],
+                "unresolved_count": len(unresolved), "truncated": len(unresolved) > 50})
             record["reconciliations"].append(entry)
             record.update(status=FINISHED, terminal="RECONCILED", ended_wall=now_wall,
                           owner=self.owner, owner_pid=os.getpid(),
@@ -421,6 +438,11 @@ def _validate(record: Any, task_id: str) -> None:
         raise ValueError("unknown record status")
     if not all(isinstance(item, dict) for item in record["attempts"]):
         raise ValueError("attempts are malformed")
+    for item in record["attempts"]:
+        if "axes" in item:
+            _copy_axes(item["axes"])
+        if "evidence" in item and len(_json_object(item["evidence"]).encode("utf-8")) > _EVIDENCE_LIMIT:
+            raise ValueError("attempt evidence exceeds 16 KiB")
     if "request" in record:
         request = record["request"]
         if (not isinstance(request, dict) or not isinstance(request.get("id"), str)
@@ -440,3 +462,60 @@ def _copy_checkpoint(value: Mapping[str, Any]) -> dict[str, Any]:
     if len(data.encode("utf-8")) > 262144:
         raise ValueError("checkpoint exceeds 256 KiB")
     return json.loads(data)
+
+
+def _copy_axes(value: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        valid = (isinstance(value, dict) and set(value) == {"process", "result", "persisted", "effects"}
+                 and all(isinstance(value[key], str) for key in ("process", "result", "effects"))
+                 and value["process"] in ("exited", "not_started", "unverified")
+                 and value["result"] in ("final", "partial", "none", "error")
+                 and type(value["persisted"]) is bool
+                 and value["effects"] in ("none_observed", "changed", "unknown"))
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError("attempt axes are malformed")
+    return dict(value)
+
+
+def _json_object(value: Mapping[str, Any]) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("attempt evidence must be an object")
+    try:
+        data = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        data.encode("utf-8")
+        return data
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("attempt evidence must be finite JSON") from exc
+
+
+def _bounded_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep a finite, bounded observation. Truncation never changes admission."""
+    data = _json_object(value)
+    size = len(data.encode("utf-8"))
+    if size <= _EVIDENCE_LIMIT:
+        return json.loads(data)
+    original = json.loads(data)
+
+    def shrink(item, count, width, depth=0):
+        if isinstance(item, str):
+            return item[:width]
+        if isinstance(item, list):
+            return [shrink(child, count, width, depth + 1) for child in item[:count]] if depth < 6 else []
+        if isinstance(item, dict):
+            if depth >= 6:
+                return {}
+            return {key: shrink(child, count, width, depth + 1)
+                    for key, child in list(item.items())[:count]}
+        return item
+
+    count, width = 50, 512
+    while True:
+        result = shrink(original, count, width)
+        result.update(truncated=True, original_bytes=size)
+        if len(_json_object(result).encode("utf-8")) <= _EVIDENCE_LIMIT:
+            return result
+        if count == 1 and width == 1:
+            return {"truncated": True, "original_bytes": size}
+        count, width = max(1, count // 2), max(1, width // 2)

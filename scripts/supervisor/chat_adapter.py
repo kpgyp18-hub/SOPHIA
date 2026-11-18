@@ -102,6 +102,11 @@ class ChatAdapter:
         """Forget this adapter's remote conversation identity."""
         self._session_id = None
 
+    @property
+    def effect_capability(self) -> str:
+        from .effect_evidence import capability
+        return capability(self)
+
     def set_model(self, model: str | None) -> bool:
         """Select a model for future turns and invalidate its remote session."""
         normalized = model.strip() if isinstance(model, str) else None
