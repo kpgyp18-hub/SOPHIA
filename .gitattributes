@@ -1,0 +1,2 @@
+# Vendored upstream files must stay byte-identical to UPSTREAM.json (no EOL conversion).
+skills/unlazy/** -text
